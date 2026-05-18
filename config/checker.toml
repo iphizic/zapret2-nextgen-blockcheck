@@ -1,0 +1,65 @@
+[workers]
+count = 4
+
+[queue]
+base_qnum = 200
+qnum_count = 64
+
+[source_port]
+mode = "os_assigned"
+bind_ipv4 = "0.0.0.0"
+bind_ipv6 = "::"
+
+[probe]
+backend = "native"
+connect_timeout_ms = 3000
+tls_timeout_ms = 3000
+first_byte_timeout_ms = 5000
+total_timeout_ms = 10000
+max_read_bytes = 65536
+user_agent = "zapret-checker"
+path = "/"
+
+[probe.protocols]
+http = false
+tls12 = true
+tls13 = false
+quic = false
+preferred = "tls12"
+
+[nfqws]
+binary = "/opt/zapret2/binaries/linux-arm64/nfqws2"
+library_paths = ["/opt/zapret2/binaries/linux-arm64"]
+base_args = [
+  "--user=daemon",
+  "--fwmark=0x40000000",
+  "--lua-init=@/opt/zapret2/lua/zapret-lib.lua",
+  "--lua-init=@/opt/zapret2/lua/zapret-antidpi.lua",
+  "--lua-init=@/opt/zapret2/lua/zapret-auto.lua",
+]
+start_grace_ms = 100
+stop_timeout_ms = 1000
+log_stderr = true
+log_stdout = false
+
+[firewall]
+backend = "nftables"
+table = "zapret_checker"
+hook = "output"
+priority = "mangle"
+cleanup_on_start = true
+cleanup_on_exit = true
+
+[debug]
+enable_curl_fallback = false
+keep_rules_on_failure = false
+verbose_nfqws = false
+
+[strategies]
+file = "config/standart/strategies.yaml"
+transition_matrix = "config/standart/transition_matrix.yaml"
+soft_fail_family_limit = 2
+successful_strategy_limit = 20
+
+[bayes]
+state_file = "config/standart/bayesian_priors.yaml"

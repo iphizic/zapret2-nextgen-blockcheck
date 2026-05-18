@@ -122,6 +122,8 @@ pub struct StrategiesConfig {
     pub file: PathBuf,
     pub transition_matrix: PathBuf,
     pub soft_fail_family_limit: usize,
+    #[serde(default = "default_successful_strategy_limit")]
+    pub successful_strategy_limit: usize,
 
     #[serde(default = "default_search_mode")]
     pub search_mode: String,
@@ -136,6 +138,10 @@ fn default_search_mode() -> String {
 
 fn default_max_candidates() -> usize {
     200
+}
+
+fn default_successful_strategy_limit() -> usize {
+    10
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -157,6 +163,7 @@ impl Default for StrategiesConfig {
             file: PathBuf::from("config/standart/strategies.yaml"),
             transition_matrix: PathBuf::from("config/standart/transition_costs.yaml"),
             soft_fail_family_limit: 2,
+            successful_strategy_limit: default_successful_strategy_limit(),
             search_mode: default_search_mode(),
             max_candidates: default_max_candidates(),
         }
@@ -211,6 +218,12 @@ impl AppConfig {
             anyhow::bail!(
                 "debug.keep_rules_on_failure conflicts with firewall.cleanup_on_exit safety"
             );
+        }
+        if self.strategies.search_mode != "signal" {
+            anyhow::bail!("strategies.search_mode must be signal");
+        }
+        if self.strategies.max_candidates == 0 {
+            anyhow::bail!("strategies.max_candidates must be greater than zero");
         }
         Ok(())
     }

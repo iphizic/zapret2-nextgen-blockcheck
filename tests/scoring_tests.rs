@@ -13,7 +13,7 @@ fn result(kind: Option<FailureKind>, outcome: ProbeOutcome) -> ProbeResult {
         target_host: "example.org".into(),
         target_ip: "127.0.0.1".parse().unwrap(),
         target_port: 443,
-        protocol: ProbeProtocol::HttpsHttp11,
+        protocol: ProbeProtocol::Tls12Http11,
         setup_ms: None,
         connect_ms: None,
         tls_ms: None,

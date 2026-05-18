@@ -10,10 +10,6 @@ pub enum ProbeProtocol {
 }
 
 impl ProbeProtocol {
-    pub fn is_tls(self) -> bool {
-        matches!(self, Self::Tls12Http11 | Self::Tls13Http11)
-    }
-
     pub fn catalog_key(self) -> &'static str {
         match self {
             Self::HttpPlain => "http",

@@ -153,7 +153,7 @@ async fn native_tls_http_probe_reads_status() {
         target_host: "example.org".into(),
         target_ip: addr.ip(),
         target_port: addr.port(),
-        protocol: ProbeProtocol::HttpsHttp11,
+        protocol: ProbeProtocol::Tls12Http11,
         path: "/".into(),
         timeouts: timeouts(),
     };

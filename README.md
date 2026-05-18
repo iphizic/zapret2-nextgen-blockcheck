@@ -55,6 +55,7 @@ Examples:
 zapret-checker check --config config/checker.toml --host youtube.com
 zapret-checker check --config config/checker.toml --host youtube.com --workers 2
 zapret-checker check --config config/checker.toml --host youtube.com --backend native
+zapret-checker check --config config/checker.toml --host youtube.com --probe-protocol tls13
 ```
 
 Options:
@@ -64,11 +65,13 @@ Options:
 - `--workers <N>`: override worker count. Effective concurrency is limited by `min(workers, qnum_count)`.
 - `--backend native`: normal mode. Uses native Rust TCP/TLS/HTTP probe.
 - `--backend curl`: debug/reference mode only. Requires `debug.enable_curl_fallback = true`.
+- `--probe-protocol <http|tls12|tls13|quic>`: select probe protocol and TLS version for `check`.
 - `--strategies-dir <DIR>`: load `<DIR>/strategies.yaml` and `<DIR>/transition_matrix.yaml`.
 - `--conf-dir <DIR>`: alias for `--strategies-dir`.
 - `--bayes-state <FILE>`: load and update Bayesian runtime posteriors in a separate YAML/JSON file.
 - `--nfqws-binary <FILE>`: override `[nfqws].binary` from config.
 - `--nfqws-lib-dir <DIR>`: add a directory to `LD_LIBRARY_PATH` for the `nfqws2` child process. Can be passed multiple times.
+- `--successful-strategy-limit <N>`: stop scheduling new strategy probes after finding this many successful strategies. `0` disables the success-count stop condition.
 
 Default strategy files come from `config/checker.toml`; this repo points them at:
 
@@ -76,6 +79,34 @@ Default strategy files come from `config/checker.toml`; this repo points them at
 config/standart/strategies.yaml
 config/standart/transition_matrix.yaml
 ```
+
+Probe protocol defaults and allow-list are configured in `[probe.protocols]`:
+
+```toml
+[probe.protocols]
+http = false
+tls12 = true
+tls13 = false
+quic = false
+preferred = "tls12"
+```
+
+`check` uses `preferred` unless `--probe-protocol` is passed. `tls12` and `tls13`
+both run HTTP/1.1 over TLS, but the native backend pins the rustls client to the
+selected TLS protocol version. The selected protocol must be enabled in config.
+`quic` is reserved in the catalog and CLI, but the native QUIC backend is not
+implemented yet.
+
+The checker stops after finding enough successful strategies by default:
+
+```toml
+[strategies]
+successful_strategy_limit = 10
+```
+
+Use `--successful-strategy-limit` to override it for one run. With parallel workers,
+the final number of successes can be slightly higher than the limit if several
+in-flight probes succeed in the same batch.
 
 On OpenWrt, make sure `nfqws2` exists and is executable. Either set it in
 `config/checker.toml`:
@@ -115,7 +146,7 @@ zapret-checker check \
 
 Runs only a direct native probe to the target. It does **not** start `nfqws2`, does **not** install firewall rules and does **not** allocate NFQUEUE.
 
-Use it to distinguish target/network problems from strategy failures. If baseline cannot connect or times out, a full `check` should not punish strategy Bayesian scores because the target may simply be unreachable.
+Use it to distinguish target/network problems from strategy failures. If baseline cannot connect or times out, a full `check` should not punish strategy Bayesian scores because the target may simply be unreachable. In `check`, the baseline uses the same selected probe protocol as strategy probes. The standalone `baseline` command currently uses a direct TLS 1.2 HTTP/1.1 probe.
 
 Example:
 

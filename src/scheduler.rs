@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 pub struct Scheduler {
     pub runtime: WorkerRuntime,
     pub workers_count: usize,
+    pub successful_strategy_limit: usize,
     pub pruning_policy: PruningPolicy,
     pub score_weights: ScoreWeights,
     pub protocol: ProbeProtocol,
@@ -59,9 +60,15 @@ impl Scheduler {
         let mut next_worker_id = 0usize;
         let mut remaining = ordered.into_iter();
         let mut out = Vec::new();
+        let mut successful_count = 0usize;
 
         loop {
             if cancel.is_cancelled() {
+                break;
+            }
+            if self.successful_strategy_limit > 0
+                && successful_count >= self.successful_strategy_limit
+            {
                 break;
             }
             let mut batch = Vec::new();
@@ -104,6 +111,9 @@ impl Scheduler {
                 .await;
 
             for (node, result) in results {
+                if result.outcome == ProbeOutcome::Success {
+                    successful_count += 1;
+                }
                 if should_update_strategy_score(&result) {
                     bayes.update(&node.id, node.prior, &result);
                 }

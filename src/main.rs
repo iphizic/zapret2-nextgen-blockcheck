@@ -12,6 +12,7 @@ mod scoring;
 mod types;
 mod worker;
 
+use anyhow::Context;
 use bayes::BayesianState;
 use clap::{Parser, Subcommand};
 use config::AppConfig;
@@ -27,7 +28,6 @@ use std::{net::ToSocketAddrs, path::PathBuf, sync::Arc};
 use tokio_util::sync::CancellationToken;
 use types::*;
 use worker::WorkerRuntime;
-use anyhow::Context;
 
 #[derive(Parser, Debug)]
 #[command(name = "zapret-checker")]
@@ -57,6 +57,8 @@ enum Commands {
         nfqws_lib_dir: Vec<PathBuf>,
         #[arg(long, value_name = "PROTO")]
         probe_protocol: Option<String>,
+        #[arg(long, value_name = "N")]
+        successful_strategy_limit: Option<usize>,
         #[arg(long)]
         json: bool,
     },
@@ -76,6 +78,7 @@ enum Commands {
 struct CheckOutput {
     baseline: ProbeResult,
     results: Vec<scheduler::StrategyRunResult>,
+    successful_strategy_limit: usize,
 }
 
 #[tokio::main]
@@ -132,6 +135,7 @@ async fn main() -> anyhow::Result<()> {
             nfqws_binary,
             nfqws_lib_dir,
             probe_protocol,
+            successful_strategy_limit,
             json,
         } => {
             let cfg = AppConfig::load(&config)?;
@@ -197,12 +201,15 @@ async fn main() -> anyhow::Result<()> {
                 protocol,
             )
             .await;
+            let successful_strategy_limit =
+                successful_strategy_limit.unwrap_or(cfg.strategies.successful_strategy_limit);
             if should_skip_strategies_after_baseline(&baseline) {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&CheckOutput {
                         baseline,
                         results: Vec::new(),
+                        successful_strategy_limit,
                     })?
                 );
                 return Ok(());
@@ -232,17 +239,21 @@ async fn main() -> anyhow::Result<()> {
             };
             let (strategies_file, transition_matrix_file) =
                 strategy_paths(&cfg, strategies_dir.as_deref());
-            let graph = StrategyGraph::load_for_protocol(
+            let mut graph = StrategyGraph::load_for_protocol(
                 &strategies_file,
                 &transition_matrix_file,
                 protocol.catalog_key(),
             )?;
+            if graph.nodes.len() > cfg.strategies.max_candidates {
+                graph.nodes.truncate(cfg.strategies.max_candidates);
+            }
             let scheduler = scheduler::Scheduler {
                 runtime,
                 workers_count: workers
                     .unwrap_or(cfg.workers.count)
                     .min(cfg.queue.qnum_count as usize)
                     .max(1),
+                successful_strategy_limit,
                 pruning_policy: PruningPolicy {
                     soft_fail_family_limit: cfg
                         .strategies
@@ -271,7 +282,11 @@ async fn main() -> anyhow::Result<()> {
             if cfg.firewall.cleanup_on_exit {
                 fw.cleanup_all().await?;
             }
-            let output = &CheckOutput { baseline, results };
+            let output = &CheckOutput {
+                baseline,
+                results,
+                successful_strategy_limit,
+            };
             if json {
                 println!("{}", serde_json::to_string_pretty(&output)?);
             } else {
@@ -493,11 +508,7 @@ fn print_probe_result(prefix: &str, r: &ProbeResult) {
             .unwrap_or_else(|| "-".into())
     );
 
-    println!(
-        "{}bytes_read:    {}",
-        prefix,
-        r.bytes_read
-    );
+    println!("{}bytes_read:    {}", prefix, r.bytes_read);
 }
 
 fn fmt_ms(v: Option<u64>) -> String {
@@ -529,6 +540,14 @@ fn print_check_report(output: &CheckOutput) {
     println!("  tested:   {}", total);
     println!("  success:  {}", success);
     println!("  failed:   {}", failed);
+    println!(
+        "  stop_at_success: {}",
+        if output.successful_strategy_limit == 0 {
+            "disabled".into()
+        } else {
+            output.successful_strategy_limit.to_string()
+        }
+    );
     println!();
 
     println!("Best strategies");
@@ -548,7 +567,7 @@ fn print_check_report(output: &CheckOutput) {
     if successful.is_empty() {
         println!("  none");
     } else {
-        for item in successful.iter().take(10) {
+        for item in successful {
             println!(
                 "  [{:>6.1}] {:<36} {:<12} http={} tls={}ms total={}ms",
                 item.adaptive_score,

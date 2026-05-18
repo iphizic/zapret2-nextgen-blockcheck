@@ -7,6 +7,10 @@ fn config_loads_checker_toml_and_validates_os_assigned_source_port() {
     assert_eq!(cfg.source_port.mode, "os_assigned");
     assert!(cfg.workers.count > 0);
     assert!(cfg.queue.qnum_count > 0);
+    assert!(cfg.probe.protocols.tls12);
+    assert!(!cfg.probe.protocols.tls13);
+    assert_eq!(cfg.probe.protocols.preferred, "tls12");
+    assert_eq!(cfg.strategies.successful_strategy_limit, 20);
 }
 
 #[test]

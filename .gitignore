@@ -3,5 +3,6 @@ target
 examples
 dist
 config/*
+!config/checker.toml
 !config/standart
 tmp

@@ -48,6 +48,7 @@ impl StrategyGraph {
         })
     }
 
+    #[allow(dead_code)]
     pub fn load(strategies_path: &Path, transition_path: &Path) -> anyhow::Result<Self> {
         Self::load_for_protocol(strategies_path, transition_path, "tls13")
     }
@@ -182,27 +183,6 @@ fn catalog_family_meta(families: &[Value]) -> HashMap<String, (f64, f64, (f64, f
     out
 }
 
-fn render_lua_desync(template: &str, params: Option<&Value>) -> String {
-    let mut rendered = template.to_string();
-    if let Some(params) = params.and_then(Value::as_mapping) {
-        for (name, values) in params {
-            let Some(name) = name.as_str() else { continue };
-            let replacement = values
-                .as_sequence()
-                .and_then(|v| v.first())
-                .and_then(value_to_string)
-                .unwrap_or_else(|| "none".to_string());
-            rendered = rendered.replace(&format!("{{{{{name}}}}}"), &replacement);
-        }
-    }
-    rendered
-        .replace("{{fooling_suffix}}", "")
-        .replace("{{tls_mod_suffix}}", "")
-        .replace("{{pattern_suffix}}", "")
-        .replace("{{seqovl_pattern_suffix}}", "")
-        .replace("{{ipfrag_suffix}}", "")
-}
-
 fn value_to_string(value: &Value) -> Option<String> {
     if let Some(s) = value.as_str() {
         Some(s.to_string())
@@ -223,10 +203,7 @@ fn value_mapping<'a>(value: &'a Value, key: &str) -> Option<&'a Mapping> {
     value.get(key).and_then(Value::as_mapping)
 }
 
-fn render_lua_desync_variants(
-    template: &str,
-    params: Option<&Value>,
-) -> Vec<String> {
+fn render_lua_desync_variants(template: &str, params: Option<&Value>) -> Vec<String> {
     let combinations = param_combinations(params);
 
     let mut out = Vec::new();
@@ -253,7 +230,8 @@ fn render_lua_desync_variants(
 
 fn apply_suffixes(mut rendered: String, combo: &[(String, String)]) -> String {
     let get = |name: &str| -> Option<&str> {
-        combo.iter()
+        combo
+            .iter()
             .find(|(k, _)| k == name)
             .map(|(_, v)| v.as_str())
     };
