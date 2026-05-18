@@ -24,7 +24,7 @@ path = "/"
 http = false
 tls12 = true
 tls13 = false
-quic = false
+quic = true
 preferred = "tls12"
 
 [nfqws]
@@ -58,10 +58,13 @@ verbose_nfqws = false
 [strategies]
 file = "config/standart/strategies.yaml"
 transition_matrix = "config/standart/transition_matrix.yaml"
-soft_fail_family_limit = 2
-successful_strategy_limit = 20
-search_mode = "signal"
-max_candidates = 200
+soft_fail_family_limit = 6
+successful_strategy_limit = 40
+search_mode = "expand"
+max_candidates = 300
+max_per_family = 24
+max_per_action = 8
+round_robin_families = true
 
 [bayes]
 state_file = "config/standart/bayesian_priors.yaml"

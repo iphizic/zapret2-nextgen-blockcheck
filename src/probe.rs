@@ -1,11 +1,12 @@
 use crate::types::*;
 use async_trait::async_trait;
+use quinn::{ClientConfig as QuinnClientConfig, Endpoint};
 use rustls::{ClientConfig, RootCertStore};
 use rustls_pki_types::{CertificateDer, ServerName};
 use std::{
     future::Future,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, Once},
     time::{Duration, Instant},
 };
 use thiserror::Error;
@@ -23,8 +24,13 @@ pub trait ProbeBackend: Send + Sync {
 }
 
 pub struct PreparedSocket {
-    pub socket: TcpSocket,
+    pub transport: PreparedTransport,
     pub assigned_source_port: u16,
+}
+
+pub enum PreparedTransport {
+    Tcp(TcpSocket),
+    Quic(Endpoint),
 }
 
 #[derive(Debug, Error)]
@@ -62,6 +68,7 @@ impl NativeTcpTlsHttpProbe {
         max_read_bytes: usize,
         user_agent: String,
     ) -> Self {
+        install_rustls_provider();
         let (tls12_config, tls12_error) = build_tls_config(Vec::new(), TlsProbeVersion::Tls12);
 
         let (tls13_config, tls13_error) = build_tls_config(Vec::new(), TlsProbeVersion::Tls13);
@@ -79,6 +86,7 @@ impl NativeTcpTlsHttpProbe {
 
     #[allow(dead_code)]
     pub fn with_extra_root_certs(mut self, certs: Vec<CertificateDer<'static>>) -> Self {
+        install_rustls_provider();
         let (tls12_config, tls12_error) = build_tls_config(certs.clone(), TlsProbeVersion::Tls12);
 
         let (tls13_config, tls13_error) = build_tls_config(certs, TlsProbeVersion::Tls13);
@@ -90,7 +98,23 @@ impl NativeTcpTlsHttpProbe {
         self
     }
 
+    #[allow(dead_code)]
     pub fn prepare_socket(&self, target_ip: IpAddr) -> Result<PreparedSocket, ProbeError> {
+        self.prepare_tcp_socket(target_ip)
+    }
+
+    pub fn prepare_transport(
+        &self,
+        protocol: ProbeProtocol,
+        target_ip: IpAddr,
+    ) -> Result<PreparedSocket, ProbeError> {
+        match protocol {
+            ProbeProtocol::QuicHttp3Future => self.prepare_quic_endpoint(target_ip),
+            _ => self.prepare_tcp_socket(target_ip),
+        }
+    }
+
+    fn prepare_tcp_socket(&self, target_ip: IpAddr) -> Result<PreparedSocket, ProbeError> {
         let socket = match target_ip {
             IpAddr::V4(_) => TcpSocket::new_v4().map_err(ProbeError::SocketCreate)?,
             IpAddr::V6(_) => TcpSocket::new_v6().map_err(ProbeError::SocketCreate)?,
@@ -104,7 +128,20 @@ impl NativeTcpTlsHttpProbe {
             .map_err(ProbeError::Bind)?;
         let assigned_source_port = socket.local_addr().map_err(ProbeError::LocalAddr)?.port();
         Ok(PreparedSocket {
-            socket,
+            transport: PreparedTransport::Tcp(socket),
+            assigned_source_port,
+        })
+    }
+
+    fn prepare_quic_endpoint(&self, target_ip: IpAddr) -> Result<PreparedSocket, ProbeError> {
+        let bind_ip = match target_ip {
+            IpAddr::V4(_) => self.bind_ipv4,
+            IpAddr::V6(_) => self.bind_ipv6,
+        };
+        let endpoint = Endpoint::client(SocketAddr::new(bind_ip, 0)).map_err(ProbeError::Bind)?;
+        let assigned_source_port = endpoint.local_addr().map_err(ProbeError::LocalAddr)?.port();
+        Ok(PreparedSocket {
+            transport: PreparedTransport::Quic(endpoint),
             assigned_source_port,
         })
     }
@@ -118,24 +155,34 @@ impl NativeTcpTlsHttpProbe {
         let total_start = Instant::now();
         let mut connect_ms = None;
         let remote = SocketAddr::new(task.target_ip, task.target_port);
+        let assigned_source_port = prepared.assigned_source_port;
 
         if let Some(token) = &ctx.cancellation {
             if token.is_cancelled() {
                 return cancelled_result(
                     &task,
                     ctx.qnum,
-                    prepared.assigned_source_port,
+                    assigned_source_port,
                     total_start.elapsed().as_millis() as u64,
                 );
             }
         }
+
+        let socket = match prepared.transport {
+            PreparedTransport::Tcp(socket) => socket,
+            PreparedTransport::Quic(endpoint) => {
+                return self
+                    .quic_probe(task, ctx, assigned_source_port, endpoint, total_start)
+                    .await
+            }
+        };
 
         let kind = probe_failure_kind(ctx.baseline);
         let connect_start = Instant::now();
         let stream = match cancellable_timeout(
             Duration::from_millis(task.timeouts.connect_ms),
             ctx.cancellation.as_ref(),
-            prepared.socket.connect(remote),
+            socket.connect(remote),
         )
         .await
         {
@@ -147,7 +194,7 @@ impl NativeTcpTlsHttpProbe {
                 return failure(
                     &task,
                     ctx.qnum,
-                    prepared.assigned_source_port,
+                    assigned_source_port,
                     ProbeOutcome::Refused,
                     kind,
                     ProbeErrorClass::ConnectFailed,
@@ -162,7 +209,7 @@ impl NativeTcpTlsHttpProbe {
                 return failure(
                     &task,
                     ctx.qnum,
-                    prepared.assigned_source_port,
+                    assigned_source_port,
                     ProbeOutcome::Timeout,
                     kind,
                     ProbeErrorClass::ConnectTimeout,
@@ -177,7 +224,7 @@ impl NativeTcpTlsHttpProbe {
                 return cancelled_result(
                     &task,
                     ctx.qnum,
-                    prepared.assigned_source_port,
+                    assigned_source_port,
                     total_start.elapsed().as_millis() as u64,
                 )
             }
@@ -188,7 +235,7 @@ impl NativeTcpTlsHttpProbe {
                 self.http_plain(
                     task,
                     ctx,
-                    prepared.assigned_source_port,
+                    assigned_source_port,
                     stream,
                     total_start,
                     connect_ms,
@@ -200,7 +247,7 @@ impl NativeTcpTlsHttpProbe {
                 self.https_http11(
                     task,
                     ctx,
-                    prepared.assigned_source_port,
+                    assigned_source_port,
                     stream,
                     total_start,
                     connect_ms,
@@ -213,7 +260,7 @@ impl NativeTcpTlsHttpProbe {
                 self.https_http11(
                     task,
                     ctx,
-                    prepared.assigned_source_port,
+                    assigned_source_port,
                     stream,
                     total_start,
                     connect_ms,
@@ -225,16 +272,143 @@ impl NativeTcpTlsHttpProbe {
             ProbeProtocol::QuicHttp3Future => failure(
                 &task,
                 ctx.qnum,
-                prepared.assigned_source_port,
+                assigned_source_port,
                 ProbeOutcome::InternalError,
                 FailureKind::InfrastructureFailure,
                 ProbeErrorClass::InternalError,
-                "QUIC backend not implemented",
+                "QUIC probe reached TCP path unexpectedly",
                 total_start,
                 connect_ms,
                 None,
                 None,
             ),
+        }
+    }
+
+    async fn quic_probe(
+        &self,
+        task: ProbeTask,
+        ctx: ProbeContext,
+        source_port: u16,
+        mut endpoint: Endpoint,
+        total_start: Instant,
+    ) -> ProbeResult {
+        let kind = probe_failure_kind(ctx.baseline);
+        let mut quic_config = match build_quic_client_config() {
+            Ok(config) => config,
+            Err(e) => {
+                return failure(
+                    &task,
+                    ctx.qnum,
+                    source_port,
+                    ProbeOutcome::InternalError,
+                    FailureKind::InfrastructureFailure,
+                    ProbeErrorClass::TlsFailed,
+                    e,
+                    total_start,
+                    None,
+                    None,
+                    None,
+                )
+            }
+        };
+        quic_config.transport_config(Arc::new(quinn::TransportConfig::default()));
+        endpoint.set_default_client_config(quic_config);
+
+        let connect_start = Instant::now();
+        let connecting = match endpoint.connect(
+            SocketAddr::new(task.target_ip, task.target_port),
+            &task.target_host,
+        ) {
+            Ok(connecting) => connecting,
+            Err(e) => {
+                return failure(
+                    &task,
+                    ctx.qnum,
+                    source_port,
+                    ProbeOutcome::InternalError,
+                    FailureKind::InfrastructureFailure,
+                    ProbeErrorClass::ConnectFailed,
+                    e.to_string(),
+                    total_start,
+                    None,
+                    None,
+                    None,
+                )
+            }
+        };
+
+        let connection = match cancellable_timeout(
+            Duration::from_millis(task.timeouts.connect_ms.max(task.timeouts.tls_ms)),
+            ctx.cancellation.as_ref(),
+            connecting,
+        )
+        .await
+        {
+            Ok(Ok(connection)) => connection,
+            Ok(Err(e)) => {
+                return failure(
+                    &task,
+                    ctx.qnum,
+                    source_port,
+                    ProbeOutcome::TlsAlert,
+                    kind,
+                    ProbeErrorClass::TlsFailed,
+                    e.to_string(),
+                    total_start,
+                    None,
+                    None,
+                    None,
+                )
+            }
+            Err(ProbeWaitError::Timeout) => {
+                return failure(
+                    &task,
+                    ctx.qnum,
+                    source_port,
+                    ProbeOutcome::Timeout,
+                    kind,
+                    ProbeErrorClass::ConnectTimeout,
+                    "QUIC connect timeout",
+                    total_start,
+                    None,
+                    None,
+                    None,
+                )
+            }
+            Err(ProbeWaitError::Cancelled) => {
+                return cancelled_result(
+                    &task,
+                    ctx.qnum,
+                    source_port,
+                    total_start.elapsed().as_millis() as u64,
+                )
+            }
+        };
+        let connect_ms = Some(connect_start.elapsed().as_millis() as u64);
+        connection.close(0u32.into(), b"zapret-checker");
+        endpoint.close(0u32.into(), b"zapret-checker");
+
+        ProbeResult {
+            strategy_id: task.strategy_id,
+            worker_id: task.worker_id,
+            qnum: if ctx.baseline { None } else { Some(ctx.qnum) },
+            assigned_source_port: Some(source_port),
+            target_host: task.target_host,
+            target_ip: task.target_ip,
+            target_port: task.target_port,
+            protocol: task.protocol,
+            setup_ms: None,
+            connect_ms,
+            tls_ms: connect_ms,
+            first_byte_ms: None,
+            total_ms: total_start.elapsed().as_millis() as u64,
+            outcome: ProbeOutcome::Success,
+            http_status: None,
+            bytes_read: 0,
+            failure_kind: None,
+            error_class: None,
+            error_message: None,
         }
     }
 
@@ -494,6 +668,13 @@ impl NativeTcpTlsHttpProbe {
     }
 }
 
+fn install_rustls_provider() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 fn build_tls_config(
     extra_root_certs: Vec<CertificateDer<'static>>,
     version: TlsProbeVersion,
@@ -527,12 +708,30 @@ fn build_tls_config(
     (cfg, error)
 }
 
+fn build_quic_client_config() -> Result<QuinnClientConfig, String> {
+    let mut root_store = RootCertStore::empty();
+    let cert_result = rustls_native_certs::load_native_certs();
+    if !cert_result.errors.is_empty() && cert_result.certs.is_empty() {
+        return Err(format!("{:?}", cert_result.errors));
+    }
+    for cert in cert_result.certs {
+        let _ = root_store.add(cert);
+    }
+    let mut crypto = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    crypto.alpn_protocols = vec![b"h3".to_vec()];
+    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(crypto))
+        .map_err(|e| e.to_string())?;
+    Ok(QuinnClientConfig::new(Arc::new(crypto)))
+}
+
 #[async_trait]
 impl ProbeBackend for NativeTcpTlsHttpProbe {
     async fn probe(&self, task: ProbeTask, ctx: ProbeContext) -> ProbeResult {
         let start = Instant::now();
         let total = Duration::from_millis(task.timeouts.total_ms);
-        let mut result = match self.prepare_socket(task.target_ip) {
+        let mut result = match self.prepare_transport(task.protocol, task.target_ip) {
             Ok(prepared) => match cancellable_timeout(
                 total,
                 ctx.cancellation.as_ref(),

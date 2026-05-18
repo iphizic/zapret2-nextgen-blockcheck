@@ -39,7 +39,10 @@ impl WorkerRuntime {
         cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> ProbeResult {
         let total_start = Instant::now();
-        let prepared = match self.native_probe.prepare_socket(task.target_ip) {
+        let prepared = match self
+            .native_probe
+            .prepare_transport(task.protocol, task.target_ip)
+        {
             Ok(s) => s,
             Err(e) => {
                 return ProbeResult::infrastructure_failure(
@@ -104,7 +107,10 @@ impl WorkerRuntime {
             source_port,
             target_ip: task.target_ip,
             target_port: task.target_port,
-            protocol: L4Protocol::Tcp,
+            protocol: match task.protocol {
+                ProbeProtocol::QuicHttp3Future => L4Protocol::Udp,
+                _ => L4Protocol::Tcp,
+            },
             hook: self.firewall_hook,
         };
         if let Err(e) = self.firewall.install_worker_rule(rule.clone()).await {

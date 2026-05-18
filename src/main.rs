@@ -3,7 +3,6 @@ mod config;
 mod firewall;
 mod graph;
 mod nfqws;
-mod ordering;
 mod probe;
 mod pruning;
 mod queue;
@@ -80,7 +79,17 @@ struct CheckOutput {
     successful_strategy_limit: usize,
     search_mode: String,
     max_candidates: usize,
+    max_per_family: usize,
+    max_per_action: usize,
+    round_robin_families: bool,
     generated_count: usize,
+}
+
+#[derive(Default)]
+struct FamilyCounters {
+    tested: usize,
+    success: usize,
+    failed: usize,
 }
 
 #[tokio::main]
@@ -214,6 +223,9 @@ async fn main() -> anyhow::Result<()> {
                         successful_strategy_limit,
                         search_mode: cfg.strategies.search_mode.clone(),
                         max_candidates: cfg.strategies.max_candidates,
+                        max_per_family: cfg.strategies.max_per_family,
+                        max_per_action: cfg.strategies.max_per_action,
+                        round_robin_families: cfg.strategies.round_robin_families,
                         generated_count: 0,
                     })?
                 );
@@ -250,6 +262,9 @@ async fn main() -> anyhow::Result<()> {
                 protocol.catalog_key(),
                 &cfg.strategies.search_mode,
                 cfg.strategies.max_candidates,
+                cfg.strategies.max_per_family,
+                cfg.strategies.max_per_action,
+                cfg.strategies.round_robin_families,
             )?;
             let generated_count = graph.nodes.len();
             let scheduler = scheduler::Scheduler {
@@ -289,6 +304,9 @@ async fn main() -> anyhow::Result<()> {
                 successful_strategy_limit,
                 search_mode: cfg.strategies.search_mode.clone(),
                 max_candidates: cfg.strategies.max_candidates,
+                max_per_family: cfg.strategies.max_per_family,
+                max_per_action: cfg.strategies.max_per_action,
+                round_robin_families: cfg.strategies.round_robin_families,
                 generated_count,
             };
             if json {
@@ -547,6 +565,9 @@ fn print_check_report(output: &CheckOutput) {
     println!("  failed:   {}", failed);
     println!("  search_mode: {}", output.search_mode);
     println!("  max_candidates: {}", output.max_candidates);
+    println!("  max_per_family: {}", output.max_per_family);
+    println!("  max_per_action: {}", output.max_per_action);
+    println!("  round_robin: {}", output.round_robin_families);
     println!(
         "  stop_at_success: {}",
         if output.successful_strategy_limit == 0 {
@@ -555,6 +576,30 @@ fn print_check_report(output: &CheckOutput) {
             output.successful_strategy_limit.to_string()
         }
     );
+    println!();
+
+    println!("Families");
+    let mut families = std::collections::BTreeMap::<String, FamilyCounters>::new();
+    for item in &output.results {
+        let counters = families.entry(item.node.family.clone()).or_default();
+        counters.tested += 1;
+        if item.result.outcome == ProbeOutcome::Success {
+            counters.success += 1;
+        } else {
+            counters.failed += 1;
+        }
+    }
+    if families.is_empty() {
+        println!("  none");
+    } else {
+        for (family, counters) in families {
+            println!(
+                "  {:<14} tested={} success={} failed={}",
+                family, counters.tested, counters.success, counters.failed
+            );
+        }
+    }
+
     println!();
 
     println!("Best strategies");

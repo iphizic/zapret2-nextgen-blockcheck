@@ -72,7 +72,7 @@ fn default_true() -> bool {
 }
 
 fn default_preferred_protocol() -> String {
-    "tls13".to_string()
+    "tls12".to_string()
 }
 
 impl Default for ProtocolProbeConfig {
@@ -82,7 +82,7 @@ impl Default for ProtocolProbeConfig {
             tls12: true,
             tls13: false,
             quic: false,
-            preferred: "tls13".to_string(),
+            preferred: "tls12".to_string(),
         }
     }
 }
@@ -130,6 +130,15 @@ pub struct StrategiesConfig {
 
     #[serde(default = "default_max_candidates")]
     pub max_candidates: usize,
+
+    #[serde(default = "default_max_per_family")]
+    pub max_per_family: usize,
+
+    #[serde(default = "default_max_per_action")]
+    pub max_per_action: usize,
+
+    #[serde(default = "default_round_robin_families")]
+    pub round_robin_families: bool,
 }
 
 fn default_search_mode() -> String {
@@ -138,6 +147,18 @@ fn default_search_mode() -> String {
 
 fn default_max_candidates() -> usize {
     200
+}
+
+fn default_max_per_family() -> usize {
+    24
+}
+
+fn default_max_per_action() -> usize {
+    8
+}
+
+fn default_round_robin_families() -> bool {
+    true
 }
 
 fn default_successful_strategy_limit() -> usize {
@@ -166,6 +187,9 @@ impl Default for StrategiesConfig {
             successful_strategy_limit: default_successful_strategy_limit(),
             search_mode: default_search_mode(),
             max_candidates: default_max_candidates(),
+            max_per_family: default_max_per_family(),
+            max_per_action: default_max_per_action(),
+            round_robin_families: default_round_robin_families(),
         }
     }
 }
@@ -195,6 +219,16 @@ impl AppConfig {
             && !self.probe.protocols.quic
         {
             anyhow::bail!("at least one protocol probe must be enabled");
+        }
+        let preferred_enabled = match self.probe.protocols.preferred.as_str() {
+            "http" => self.probe.protocols.http,
+            "tls12" => self.probe.protocols.tls12,
+            "tls13" => self.probe.protocols.tls13,
+            "quic" => self.probe.protocols.quic,
+            _ => false,
+        };
+        if !preferred_enabled {
+            anyhow::bail!("probe.protocols.preferred is disabled in probe.protocols");
         }
         if self.workers.count == 0 {
             anyhow::bail!("workers.count must be greater than zero");
@@ -227,6 +261,12 @@ impl AppConfig {
         }
         if self.strategies.max_candidates == 0 {
             anyhow::bail!("strategies.max_candidates must be greater than zero");
+        }
+        if self.strategies.max_per_family == 0 {
+            anyhow::bail!("strategies.max_per_family must be greater than zero");
+        }
+        if self.strategies.max_per_action == 0 {
+            anyhow::bail!("strategies.max_per_action must be greater than zero");
         }
         Ok(())
     }

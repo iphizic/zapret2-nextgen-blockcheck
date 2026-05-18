@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping, Value};
 use std::{
-    collections::{HashMap, HashSet},
+    cmp::Ordering,
+    collections::{BTreeMap, HashMap, HashSet},
     path::Path,
 };
 
@@ -9,28 +10,28 @@ use std::{
 pub struct StrategyNode {
     pub id: String,
     pub family: String,
+    #[serde(default = "default_action_id")]
+    pub action_id: String,
     pub args: Vec<String>,
     pub cost: f64,
     pub risk: f64,
     pub prior: (f64, f64),
 }
 
+fn default_action_id() -> String {
+    "manual".into()
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct StrategyGraph {
     pub nodes: Vec<StrategyNode>,
+    #[allow(dead_code)]
     pub transition_cost: HashMap<(String, String), f64>,
 }
 
 impl StrategyGraph {
     pub fn ordered_seed(&self) -> Vec<StrategyNode> {
-        let mut n = self.nodes.clone();
-        n.sort_by(|a, b| {
-            a.cost
-                .total_cmp(&b.cost)
-                .then_with(|| a.risk.total_cmp(&b.risk))
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        n
+        self.nodes.clone()
     }
 
     #[allow(dead_code)]
@@ -45,6 +46,9 @@ impl StrategyGraph {
             protocol_key,
             "signal",
             default_max_candidates(),
+            default_max_per_family(),
+            default_max_per_action(),
+            default_round_robin_families(),
         )
     }
 
@@ -54,16 +58,32 @@ impl StrategyGraph {
         protocol_key: &str,
         search_mode: &str,
         max_candidates: usize,
+        max_per_family: usize,
+        max_per_action: usize,
+        round_robin_families: bool,
     ) -> anyhow::Result<Self> {
         let strategies_text = std::fs::read_to_string(strategies_path)?;
         let strategies_yaml: Value = serde_yaml::from_str(&strategies_text)?;
 
         let nodes = if let Some(strategies) = value_seq(&strategies_yaml, "strategies") {
-            let mut nodes = parse_simple_strategies(strategies)?;
-            nodes.truncate(max_candidates);
-            nodes
+            select_diverse_nodes(
+                parse_simple_strategies(strategies)?,
+                protocol_key,
+                max_candidates,
+                max_per_family,
+                max_per_action,
+                round_robin_families,
+            )
         } else {
-            parse_catalog_strategies(&strategies_yaml, protocol_key, search_mode, max_candidates)?
+            parse_catalog_strategies(
+                &strategies_yaml,
+                protocol_key,
+                search_mode,
+                max_candidates,
+                max_per_family,
+                max_per_action,
+                round_robin_families,
+            )?
         };
 
         let transition_text = std::fs::read_to_string(transition_path)?;
@@ -83,6 +103,9 @@ impl StrategyGraph {
             "tls13",
             "signal",
             default_max_candidates(),
+            default_max_per_family(),
+            default_max_per_action(),
+            default_round_robin_families(),
         )
     }
 }
@@ -91,13 +114,31 @@ fn default_max_candidates() -> usize {
     200
 }
 
+fn default_max_per_family() -> usize {
+    24
+}
+
+fn default_max_per_action() -> usize {
+    8
+}
+
+fn default_round_robin_families() -> bool {
+    true
+}
+
 fn parse_simple_strategies(strategies: &[Value]) -> anyhow::Result<Vec<StrategyNode>> {
-    strategies
+    let mut nodes: Vec<StrategyNode> = strategies
         .iter()
         .cloned()
         .map(serde_yaml::from_value)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(Into::into)
+        .map_err(anyhow::Error::from)?;
+    for node in &mut nodes {
+        if node.action_id.is_empty() || node.action_id == "manual" {
+            node.action_id = node.family.clone();
+        }
+    }
+    Ok(nodes)
 }
 
 fn parse_transition_costs(text: &str) -> anyhow::Result<HashMap<(String, String), f64>> {
@@ -128,6 +169,9 @@ fn parse_catalog_strategies(
     protocol_key: &str,
     search_mode: &str,
     max_candidates: usize,
+    max_per_family: usize,
+    max_per_action: usize,
+    round_robin_families: bool,
 ) -> anyhow::Result<Vec<StrategyNode>> {
     let families = value_seq(root, "families")
         .ok_or_else(|| anyhow::anyhow!("strategy catalog missing strategies/families"))?;
@@ -215,8 +259,14 @@ fn parse_catalog_strategies(
         );
     }
 
-    nodes.truncate(max_candidates);
-    Ok(nodes)
+    Ok(select_diverse_nodes(
+        nodes,
+        protocol_key,
+        max_candidates,
+        max_per_family,
+        max_per_action,
+        round_robin_families,
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -330,6 +380,7 @@ fn append_family_actions(
             nodes.push(StrategyNode {
                 id: format!("{protocol_key}_{}_{}_{}", family.id, action.id, nodes.len()),
                 family: family.id.clone(),
+                action_id: action.id.clone(),
                 args: vec![args_key],
                 cost: family.cost,
                 risk: family.risk,
@@ -337,6 +388,141 @@ fn append_family_actions(
             });
         }
     }
+}
+
+pub fn select_diverse_nodes(
+    nodes: Vec<StrategyNode>,
+    protocol_key: &str,
+    max_candidates: usize,
+    max_per_family: usize,
+    max_per_action: usize,
+    round_robin_families: bool,
+) -> Vec<StrategyNode> {
+    let mut seen_args = HashSet::new();
+    let mut per_family = HashMap::<String, usize>::new();
+    let mut per_action = HashMap::<(String, String), usize>::new();
+    let mut filtered = Vec::new();
+
+    for node in nodes {
+        let args_key = node.args.join("\0");
+        if !seen_args.insert(args_key) {
+            continue;
+        }
+        let family_count = per_family.entry(node.family.clone()).or_default();
+        if *family_count >= max_per_family {
+            continue;
+        }
+        let action_key = (node.family.clone(), node.action_id.clone());
+        let action_count = per_action.entry(action_key).or_default();
+        if *action_count >= max_per_action {
+            continue;
+        }
+        *family_count += 1;
+        *action_count += 1;
+        filtered.push(node);
+    }
+
+    let selected = if round_robin_families {
+        round_robin_by_family(filtered, max_candidates)
+    } else {
+        let mut nodes = filtered;
+        nodes.sort_by(compare_node_quality);
+        nodes.truncate(max_candidates);
+        nodes
+    };
+
+    reindex_nodes(protocol_key, selected)
+}
+
+fn round_robin_by_family(nodes: Vec<StrategyNode>, max_candidates: usize) -> Vec<StrategyNode> {
+    let mut family_order = Vec::<String>::new();
+    let mut groups = BTreeMap::<String, Vec<StrategyNode>>::new();
+
+    for node in nodes {
+        if !groups.contains_key(&node.family) {
+            family_order.push(node.family.clone());
+        }
+        groups.entry(node.family.clone()).or_default().push(node);
+    }
+
+    family_order.sort_by(|a, b| {
+        family_diversity_rank(a)
+            .cmp(&family_diversity_rank(b))
+            .then_with(|| a.cmp(b))
+    });
+
+    for group in groups.values_mut() {
+        group.sort_by(compare_node_quality);
+    }
+
+    let mut selected = Vec::new();
+    loop {
+        let mut made_progress = false;
+        for family in &family_order {
+            if selected.len() >= max_candidates {
+                return selected;
+            }
+            let Some(group) = groups.get_mut(family) else {
+                continue;
+            };
+            if group.is_empty() {
+                continue;
+            }
+            selected.push(group.remove(0));
+            made_progress = true;
+        }
+        if !made_progress {
+            break;
+        }
+    }
+    selected
+}
+
+pub fn prior_success_ratio(node: &StrategyNode) -> f64 {
+    let (a, b) = node.prior;
+    if a + b <= 0.0 {
+        0.5
+    } else {
+        a / (a + b)
+    }
+}
+
+pub fn compare_node_quality(a: &StrategyNode, b: &StrategyNode) -> Ordering {
+    a.cost
+        .total_cmp(&b.cost)
+        .then_with(|| a.risk.total_cmp(&b.risk))
+        .then_with(|| prior_success_ratio(b).total_cmp(&prior_success_ratio(a)))
+        .then_with(|| a.id.cmp(&b.id))
+}
+
+pub fn family_diversity_rank(family: &str) -> usize {
+    match family {
+        "split" => 0,
+        "fake" => 1,
+        "disorder" => 2,
+        "wsize" => 3,
+        "faked_split" => 4,
+        "seqovl" => 5,
+        "syndata" => 6,
+        "ipfrag" => 7,
+        "oob" => 8,
+        "udp_len" => 9,
+        "http_trick" => 10,
+        "hostfake" => 11,
+        "ipv6_ext" => 12,
+        _ => 99,
+    }
+}
+
+fn reindex_nodes(protocol_key: &str, nodes: Vec<StrategyNode>) -> Vec<StrategyNode> {
+    nodes
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut node)| {
+            node.id = format!("{}_{}_{}_{}", protocol_key, node.family, node.action_id, i);
+            node
+        })
+        .collect()
 }
 
 fn protocol_matches(protocols: &[String], protocol_key: &str, template: &str) -> bool {

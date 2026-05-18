@@ -87,30 +87,37 @@ Probe protocol defaults and allow-list are configured in `[probe.protocols]`:
 http = false
 tls12 = true
 tls13 = false
-quic = false
+quic = true
 preferred = "tls12"
 ```
 
 `check` uses `preferred` unless `--probe-protocol` is passed. `tls12` and `tls13`
 both run HTTP/1.1 over TLS, but the native backend pins the rustls client to the
 selected TLS protocol version. The selected protocol must be enabled in config.
-`quic` is reserved in the catalog and CLI, but the native QUIC backend is not
-implemented yet.
+`quic` uses the native QUIC probe. The current implementation performs a QUIC
+TLS 1.3 handshake with ALPN `h3` over an OS-assigned UDP source port; HTTP/3
+response parsing is not implemented yet, so `http_status` remains empty for QUIC.
 
 The checker stops after finding enough successful strategies by default:
 
 ```toml
 [strategies]
-search_mode = "signal"
-max_candidates = 200
-successful_strategy_limit = 20
+search_mode = "expand"
+max_candidates = 300
+max_per_family = 24
+max_per_action = 8
+round_robin_families = true
+soft_fail_family_limit = 6
+successful_strategy_limit = 40
 ```
 
 Use `--successful-strategy-limit` to override it for one run. With parallel workers,
 the final number of successes can be slightly higher than the limit if several
 in-flight probes succeed in the same batch. `search_mode` can be `signal`,
 `expand`, or `force`; `max_candidates` caps generated concrete strategy variants
-after parameter expansion and de-duplication.
+after parameter expansion and de-duplication. `max_per_family`,
+`max_per_action`, and `round_robin_families` keep generated candidates diverse so
+one family does not fill the whole search budget.
 
 On OpenWrt, make sure `nfqws2` exists and is executable. Either set it in
 `config/checker.toml`:

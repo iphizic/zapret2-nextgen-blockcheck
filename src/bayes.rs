@@ -12,6 +12,7 @@ pub struct Posterior {
 }
 
 impl Posterior {
+    #[allow(dead_code)]
     pub fn mean(&self) -> f64 {
         self.alpha / (self.alpha + self.beta)
     }
@@ -96,6 +97,7 @@ impl BayesianState {
         p.tests += 1;
     }
 
+    #[allow(dead_code)]
     pub fn thompson_like_score(&self, key: &str, prior: (f64, f64), cost: f64, risk: f64) -> f64 {
         let p = self.posteriors.get(key).cloned().unwrap_or(Posterior {
             alpha: prior.0,

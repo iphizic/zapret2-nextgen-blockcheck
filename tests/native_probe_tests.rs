@@ -7,7 +7,7 @@ use tokio::{
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 use zapret_checker::{
-    probe::{NativeTcpTlsHttpProbe, ProbeBackend},
+    probe::{NativeTcpTlsHttpProbe, PreparedTransport, ProbeBackend},
     types::*,
 };
 
@@ -45,8 +45,10 @@ async fn bind_zero_assigns_source_port_and_socket_holds_it_until_connect() {
         let (_stream, peer) = listener.accept().await.unwrap();
         peer
     });
-    let stream = prepared
-        .socket
+    let PreparedTransport::Tcp(socket) = prepared.transport else {
+        panic!("expected TCP prepared socket");
+    };
+    let stream = socket
         .connect(SocketAddr::new(remote.ip(), remote.port()))
         .await
         .unwrap();

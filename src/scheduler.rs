@@ -1,7 +1,6 @@
 use crate::{
     bayes::BayesianState,
     graph::{StrategyGraph, StrategyNode},
-    ordering::tsp_like_local_ordering,
     pruning::{should_update_strategy_score, PruningPolicy, PruningState},
     scoring::{adaptive_score, ScoreWeights},
     types::*,
@@ -151,21 +150,7 @@ impl Scheduler {
     }
 
     fn order_nodes(&self, graph: &StrategyGraph, bayes: &BayesianState) -> Vec<StrategyNode> {
-        let mut scored = graph
-            .ordered_seed()
-            .into_iter()
-            .map(|node| {
-                let score = bayes.thompson_like_score(&node.id, node.prior, node.cost, node.risk);
-                (node, score)
-            })
-            .collect::<Vec<_>>();
-        scored.sort_by(|(a, sa), (b, sb)| {
-            sb.total_cmp(&sa)
-                .then_with(|| a.cost.total_cmp(&b.cost))
-                .then_with(|| a.risk.total_cmp(&b.risk))
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        let nodes = scored.into_iter().map(|(node, _)| node).collect::<Vec<_>>();
-        tsp_like_local_ordering(&nodes, &graph.transition_cost)
+        let _ = bayes;
+        graph.ordered_seed()
     }
 }
