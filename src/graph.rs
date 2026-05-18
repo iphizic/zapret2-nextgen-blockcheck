@@ -116,24 +116,22 @@ fn parse_catalog_strategies(root: &Value, protocol_key: &str) -> anyhow::Result<
             };
 
             let params = candidate.get("params");
-            let lua = render_lua_desync(lua_template, params);
-            if lua.contains("{{") || lua.contains("}}") {
-                continue;
-            }
             let (cost, risk, prior) =
                 family_meta
                     .get(family)
                     .cloned()
                     .unwrap_or((5.0, 3.0, (2.0, 2.0)));
 
-            nodes.push(StrategyNode {
-                id: format!("{protocol_key}_{family}_{action_id}_{}", nodes.len()),
-                family: family.to_string(),
-                args: vec![format!("--lua-desync={lua}")],
-                cost,
-                risk,
-                prior,
-            });
+            for lua in render_lua_desync_variants(lua_template, params) {
+                nodes.push(StrategyNode {
+                    id: format!("{protocol_key}_{family}_{action_id}_{}", nodes.len()),
+                    family: family.to_string(),
+                    args: vec![format!("--lua-desync={lua}")],
+                    cost,
+                    risk,
+                    prior,
+                });
+            }
         }
     }
 
@@ -223,4 +221,128 @@ fn value_seq<'a>(value: &'a Value, key: &str) -> Option<&'a Vec<Value>> {
 
 fn value_mapping<'a>(value: &'a Value, key: &str) -> Option<&'a Mapping> {
     value.get(key).and_then(Value::as_mapping)
+}
+
+fn render_lua_desync_variants(
+    template: &str,
+    params: Option<&Value>,
+) -> Vec<String> {
+    let combinations = param_combinations(params);
+
+    let mut out = Vec::new();
+
+    for combo in combinations {
+        let mut rendered = template.to_string();
+
+        for (name, value) in &combo {
+            rendered = rendered.replace(&format!("{{{{{name}}}}}"), value);
+        }
+
+        rendered = apply_suffixes(rendered, &combo);
+
+        // Не запускать битые шаблоны.
+        if rendered.contains("{{") || rendered.contains("}}") {
+            continue;
+        }
+
+        out.push(rendered);
+    }
+
+    out
+}
+
+fn apply_suffixes(mut rendered: String, combo: &[(String, String)]) -> String {
+    let get = |name: &str| -> Option<&str> {
+        combo.iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    };
+
+    let fooling_suffix = match get("fooling").unwrap_or("none") {
+        "none" => "",
+        "badsum" => ":badsum",
+        "autottl" => ":autottl",
+        "badsum_autottl" => ":badsum:autottl",
+        "md5sig" => ":md5sig",
+        "timestamp" => ":timestamp",
+        "badseq" => ":badseq",
+        "badack" => ":badack",
+        "md5sig_autottl" => ":md5sig:autottl",
+        _ => "",
+    };
+
+    let tls_mod_suffix = match get("tls_mod").unwrap_or("none") {
+        "none" => "",
+        "random_sni" => ":tls_mod=random_sni",
+        "random_session_id" => ":tls_mod=random_session_id",
+        _ => "",
+    };
+
+    let pattern_suffix = match get("pattern").unwrap_or("zero") {
+        "zero" => "",
+        "random" => ":pattern=random",
+        _ => "",
+    };
+
+    let seqovl_pattern_suffix = match get("seqovl_pattern").unwrap_or("zero") {
+        "zero" => "",
+        "random" => ":seqovl_pattern=random",
+        _ => "",
+    };
+
+    rendered = rendered.replace("{{fooling_suffix}}", fooling_suffix);
+    rendered = rendered.replace("{{tls_mod_suffix}}", tls_mod_suffix);
+    rendered = rendered.replace("{{pattern_suffix}}", pattern_suffix);
+    rendered = rendered.replace("{{seqovl_pattern_suffix}}", seqovl_pattern_suffix);
+    rendered = rendered.replace("{{ipfrag_suffix}}", "");
+
+    rendered
+}
+
+fn param_combinations(params: Option<&Value>) -> Vec<Vec<(String, String)>> {
+    let Some(mapping) = params.and_then(Value::as_mapping) else {
+        return vec![Vec::new()];
+    };
+
+    let mut keys_values: Vec<(String, Vec<String>)> = Vec::new();
+
+    for (name, values) in mapping {
+        let Some(name) = name.as_str() else {
+            continue;
+        };
+
+        let values: Vec<String> = if let Some(seq) = values.as_sequence() {
+            seq.iter().filter_map(value_to_string).collect()
+        } else {
+            value_to_string(values).into_iter().collect()
+        };
+
+        if values.is_empty() {
+            continue;
+        }
+
+        keys_values.push((name.to_string(), values));
+    }
+
+    if keys_values.is_empty() {
+        return vec![Vec::new()];
+    }
+
+    let mut out: Vec<Vec<(String, String)>> = vec![Vec::new()];
+
+    for (key, values) in keys_values {
+        let mut next = Vec::new();
+
+        for existing in &out {
+            for value in &values {
+                let mut candidate = existing.clone();
+                candidate.push((key.clone(), value.clone()));
+                next.push(candidate);
+            }
+        }
+
+        out = next;
+    }
+
+    out
 }

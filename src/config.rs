@@ -121,7 +121,21 @@ pub struct DebugConfig {
 pub struct StrategiesConfig {
     pub file: PathBuf,
     pub transition_matrix: PathBuf,
-    pub soft_fail_family_limit: u32,
+    pub soft_fail_family_limit: usize,
+
+    #[serde(default = "default_search_mode")]
+    pub search_mode: String,
+
+    #[serde(default = "default_max_candidates")]
+    pub max_candidates: usize,
+}
+
+fn default_search_mode() -> String {
+    "signal".into()
+}
+
+fn default_max_candidates() -> usize {
+    200
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -140,9 +154,11 @@ impl Default for BayesConfig {
 impl Default for StrategiesConfig {
     fn default() -> Self {
         Self {
-            file: PathBuf::from("../config/standart/strategies.yaml"),
-            transition_matrix: PathBuf::from("../config/standart/transition_matrix.yaml"),
+            file: PathBuf::from("config/standart/strategies.yaml"),
+            transition_matrix: PathBuf::from("config/standart/transition_costs.yaml"),
             soft_fail_family_limit: 2,
+            search_mode: default_search_mode(),
+            max_candidates: default_max_candidates(),
         }
     }
 }

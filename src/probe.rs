@@ -466,6 +466,10 @@ impl NativeTcpTlsHttpProbe {
         };
         let first_byte_ms = Some(first_byte_start.elapsed().as_millis() as u64);
         let status = parse_http_status(&buf[..n]).ok();
+        let outcome = probe_outcome_for_http_status(status);
+        let (failure_kind, error_class, error_message) =
+            classify_probe_outcome(outcome, ctx.baseline);
+
         ProbeResult {
             strategy_id: task.strategy_id,
             worker_id: task.worker_id,
@@ -480,12 +484,12 @@ impl NativeTcpTlsHttpProbe {
             tls_ms,
             first_byte_ms,
             total_ms: total_start.elapsed().as_millis() as u64,
-            outcome: probe_outcome_for_http_status(status),
+            outcome,
             http_status: status,
             bytes_read: n,
-            failure_kind: None,
-            error_class: None,
-            error_message: None,
+            failure_kind,
+            error_class,
+            error_message,
         }
     }
 }
@@ -799,9 +803,79 @@ fn probe_failure_kind(baseline: bool) -> FailureKind {
 
 pub fn probe_outcome_for_http_status(status: Option<u16>) -> ProbeOutcome {
     match status {
+        Some(200..=399) => ProbeOutcome::Success,
         Some(403) | Some(451) => ProbeOutcome::HttpBlockPage,
-        Some(_) => ProbeOutcome::Success,
-        None => ProbeOutcome::Success,
+        Some(_) => ProbeOutcome::HttpBlockPage,
+        None => ProbeOutcome::EmptyResponse,
+    }
+}
+
+fn classify_probe_outcome(
+    outcome: ProbeOutcome,
+    baseline: bool,
+) -> (Option<FailureKind>, Option<ProbeErrorClass>, Option<String>) {
+    match outcome {
+        ProbeOutcome::Success => (None, None, None),
+
+        ProbeOutcome::Cancelled => (
+            Some(FailureKind::Cancelled),
+            Some(ProbeErrorClass::Cancelled),
+            Some("cancelled".into()),
+        ),
+
+        ProbeOutcome::HttpBlockPage => (
+            Some(probe_failure_kind(baseline)),
+            Some(ProbeErrorClass::InvalidHttpResponse),
+            Some("HTTP block page/status".into()),
+        ),
+
+        ProbeOutcome::EmptyResponse => (
+            Some(probe_failure_kind(baseline)),
+            Some(ProbeErrorClass::ReadFailed),
+            Some("empty response".into()),
+        ),
+
+        ProbeOutcome::Timeout => (
+            Some(probe_failure_kind(baseline)),
+            Some(ProbeErrorClass::ReadTimeout),
+            Some("timeout".into()),
+        ),
+
+        ProbeOutcome::TcpReset => (
+            Some(probe_failure_kind(baseline)),
+            Some(ProbeErrorClass::ReadFailed),
+            Some("TCP reset".into()),
+        ),
+
+        ProbeOutcome::TlsAlert => (
+            Some(probe_failure_kind(baseline)),
+            Some(ProbeErrorClass::TlsFailed),
+            Some("TLS alert".into()),
+        ),
+
+        ProbeOutcome::Refused => (
+            Some(probe_failure_kind(baseline)),
+            Some(ProbeErrorClass::ConnectFailed),
+            Some("connection refused".into()),
+        ),
+
+        ProbeOutcome::NetworkUnreachable => (
+            Some(probe_failure_kind(baseline)),
+            Some(ProbeErrorClass::ConnectFailed),
+            Some("network unreachable".into()),
+        ),
+
+        ProbeOutcome::DnsFailure => (
+            Some(probe_failure_kind(baseline)),
+            Some(ProbeErrorClass::ConnectFailed),
+            Some("DNS failure".into()),
+        ),
+
+        ProbeOutcome::InternalError => (
+            Some(FailureKind::InfrastructureFailure),
+            Some(ProbeErrorClass::InternalError),
+            Some("internal error".into()),
+        ),
     }
 }
 

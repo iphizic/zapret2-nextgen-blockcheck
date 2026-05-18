@@ -27,6 +27,7 @@ use std::{net::ToSocketAddrs, path::PathBuf, sync::Arc};
 use tokio_util::sync::CancellationToken;
 use types::*;
 use worker::WorkerRuntime;
+use anyhow::Context;
 
 #[derive(Parser, Debug)]
 #[command(name = "zapret-checker")]
@@ -56,6 +57,8 @@ enum Commands {
         nfqws_lib_dir: Vec<PathBuf>,
         #[arg(long, value_name = "PROTO")]
         probe_protocol: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
     Baseline {
         #[arg(long)]
@@ -129,6 +132,7 @@ async fn main() -> anyhow::Result<()> {
             nfqws_binary,
             nfqws_lib_dir,
             probe_protocol,
+            json,
         } => {
             let cfg = AppConfig::load(&config)?;
             let backend = backend.unwrap_or_else(|| cfg.probe.backend.clone());
@@ -240,7 +244,11 @@ async fn main() -> anyhow::Result<()> {
                     .min(cfg.queue.qnum_count as usize)
                     .max(1),
                 pruning_policy: PruningPolicy {
-                    soft_fail_family_limit: cfg.strategies.soft_fail_family_limit,
+                    soft_fail_family_limit: cfg
+                        .strategies
+                        .soft_fail_family_limit
+                        .try_into()
+                        .context("strategies.soft_fail_family_limit does not fit into u32")?,
                     combo_requires_signal: true,
                 },
                 score_weights: ScoreWeights::default(),
@@ -263,10 +271,12 @@ async fn main() -> anyhow::Result<()> {
             if cfg.firewall.cleanup_on_exit {
                 fw.cleanup_all().await?;
             }
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&CheckOutput { baseline, results })?
-            );
+            let output = &CheckOutput { baseline, results };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else {
+                print_check_report(&output);
+            }
         }
     }
     Ok(())
@@ -301,12 +311,9 @@ async fn run_baseline_probe(
 }
 
 fn should_skip_strategies_after_baseline(result: &ProbeResult) -> bool {
-    if result.failure_kind == Some(FailureKind::InfrastructureFailure) {
-        return true;
-    }
     matches!(
-        result.outcome,
-        ProbeOutcome::NetworkUnreachable | ProbeOutcome::DnsFailure | ProbeOutcome::Refused
+        result.failure_kind,
+        Some(FailureKind::InfrastructureFailure) | Some(FailureKind::Cancelled)
     )
 }
 
@@ -458,4 +465,137 @@ fn shutdown_token() -> CancellationToken {
         });
     }
     token
+}
+
+fn print_probe_result(prefix: &str, r: &ProbeResult) {
+    println!("{}outcome:       {:?}", prefix, r.outcome);
+    println!("{}failure_kind:  {:?}", prefix, r.failure_kind);
+    println!("{}error_class:   {:?}", prefix, r.error_class);
+
+    if let Some(msg) = &r.error_message {
+        println!("{}error:         {}", prefix, msg);
+    }
+
+    println!(
+        "{}timing:        connect={}ms tls={}ms first_byte={}ms total={}ms",
+        prefix,
+        fmt_ms(r.connect_ms),
+        fmt_ms(r.tls_ms),
+        fmt_ms(r.first_byte_ms),
+        r.total_ms,
+    );
+
+    println!(
+        "{}http_status:   {}",
+        prefix,
+        r.http_status
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".into())
+    );
+
+    println!(
+        "{}bytes_read:    {}",
+        prefix,
+        r.bytes_read
+    );
+}
+
+fn fmt_ms(v: Option<u64>) -> String {
+    v.map(|x| x.to_string()).unwrap_or_else(|| "-".into())
+}
+
+fn print_check_report(output: &CheckOutput) {
+    println!("Target");
+    println!("  host:     {}", output.baseline.target_host);
+    println!("  ip:       {}", output.baseline.target_ip);
+    println!("  port:     {}", output.baseline.target_port);
+    println!("  protocol: {:?}", output.baseline.protocol);
+    println!();
+
+    println!("Baseline");
+    print_probe_result("  ", &output.baseline);
+    println!();
+
+    let total = output.results.len();
+    let success = output
+        .results
+        .iter()
+        .filter(|r| r.result.outcome == ProbeOutcome::Success)
+        .count();
+
+    let failed = total.saturating_sub(success);
+
+    println!("Summary");
+    println!("  tested:   {}", total);
+    println!("  success:  {}", success);
+    println!("  failed:   {}", failed);
+    println!();
+
+    println!("Best strategies");
+
+    let mut successful: Vec<_> = output
+        .results
+        .iter()
+        .filter(|r| r.result.outcome == ProbeOutcome::Success)
+        .collect();
+
+    successful.sort_by(|a, b| {
+        b.adaptive_score
+            .partial_cmp(&a.adaptive_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    if successful.is_empty() {
+        println!("  none");
+    } else {
+        for item in successful.iter().take(10) {
+            println!(
+                "  [{:>6.1}] {:<36} {:<12} http={} tls={}ms total={}ms",
+                item.adaptive_score,
+                item.node.id,
+                item.node.family,
+                item.result
+                    .http_status
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".into()),
+                item.result
+                    .tls_ms
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".into()),
+                item.result.total_ms,
+            );
+
+            for arg in &item.node.args {
+                println!("           {}", arg);
+            }
+        }
+    }
+
+    println!();
+
+    println!("Failed strategies");
+
+    for item in output
+        .results
+        .iter()
+        .filter(|r| r.result.outcome != ProbeOutcome::Success)
+        .take(20)
+    {
+        println!(
+            "  [{:>6.1}] {:<36} {:<12} {:?} / {:?}",
+            item.adaptive_score,
+            item.node.id,
+            item.node.family,
+            item.result.outcome,
+            item.result.error_class,
+        );
+
+        if let Some(msg) = &item.result.error_message {
+            println!("           {}", msg);
+        }
+
+        for arg in &item.node.args {
+            println!("           {}", arg);
+        }
+    }
 }

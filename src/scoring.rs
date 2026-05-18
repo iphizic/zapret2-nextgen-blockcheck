@@ -20,18 +20,30 @@ impl Default for ScoreWeights {
 }
 
 pub fn adaptive_score(result: &ProbeResult, cost: f64, risk: f64, w: ScoreWeights) -> f64 {
-    let mut s = match result.outcome {
-        ProbeOutcome::Success => w.success,
-        ProbeOutcome::Timeout => -w.timeout_penalty,
-        ProbeOutcome::Cancelled => 0.0,
-        _ => -5.0,
-    };
     if matches!(
         result.failure_kind,
-        Some(FailureKind::InfrastructureFailure)
+        Some(FailureKind::InfrastructureFailure) | Some(FailureKind::Cancelled)
     ) {
         return 0.0;
     }
+
+    let mut s = match result.outcome {
+        ProbeOutcome::Success => w.success,
+
+        ProbeOutcome::Timeout
+        | ProbeOutcome::TlsAlert
+        | ProbeOutcome::TcpReset
+        | ProbeOutcome::HttpBlockPage
+        | ProbeOutcome::EmptyResponse
+        | ProbeOutcome::Refused => -w.timeout_penalty,
+
+        ProbeOutcome::Cancelled => 0.0,
+
+        ProbeOutcome::DnsFailure
+        | ProbeOutcome::NetworkUnreachable
+        | ProbeOutcome::InternalError => 0.0,
+    };
+
     s -= cost * w.cost_penalty;
     s -= risk * w.risk_penalty;
     s
