@@ -1,0 +1,1216 @@
+version: 1
+kind: zapret2_strategy_catalog
+name: strategies.full
+schema: zapret2-strategy-catalog/v1
+description: >
+  Full declarative strategy catalog for a Rust-based adaptive zapret2/nfqws2
+  DPI strategy checker. The catalog is intended for Strategy Graph + Bayesian
+  Priors + Adaptive Scoring + TSP-like Local Ordering + Early Pruning.
+  It describes strategy families, candidate generators, parameters, combo rules,
+  scoring metadata and backend rendering to nfqws2 --lua-desync arguments.
+
+metadata:
+  generated_for: zapret2-strategy-graph-async
+  generated_at: "2026-05-18"
+  primary_backend: nfqws2
+  config_style: lua_desync
+  notes:
+    - "This catalog is intentionally broad. Disable risky/heavy families for low-power OpenWrt devices if needed."
+    - "Values are candidate-search spaces, not guaranteed working defaults."
+    - "The checker should generate concrete StrategyTask instances from this catalog."
+    - "Some functions are protocol- or topology-specific; observe requires/caveats fields."
+
+# Shared symbolic domains used by candidate generators.
+constants:
+  protocols:
+    - http
+    - tls12
+    - tls13
+    - quic
+    - udp_generic
+  ip_versions: [4, 6]
+  l7_payloads:
+    http: http_req
+    tls12: tls_client_hello
+    tls13: tls_client_hello
+    quic: quic_initial
+    udp_generic: udp
+  default_blobs:
+    http: fake_default_http
+    tls: fake_default_tls
+    quic: fake_default_quic
+    udp: fake_default_udp
+  split_positions:
+    http_core:
+      - method+2
+      - host
+      - host+1
+      - midsld
+      - endhost-1
+      - endhost
+    http_extended:
+      - 1
+      - 2
+      - method+2
+      - host
+      - host+1
+      - midsld
+      - endhost-2
+      - endhost-1
+      - endhost
+      - -1
+    tls_core:
+      - 1
+      - 2
+      - sniext+1
+      - sniext+4
+      - host+1
+      - midsld
+      - endhost-1
+    tls_extended:
+      - 1
+      - 2
+      - 3
+      - sniext
+      - sniext+1
+      - sniext+4
+      - host
+      - host+1
+      - midsld
+      - endhost-2
+      - endhost-1
+      - endhost
+      - extlen
+      - -1
+    tcp_generic:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - -1
+  fooling_sets:
+    safe:
+      - none
+    common:
+      - badsum
+      - autottl
+      - badsum_autottl
+    tcp_extra:
+      - md5sig
+      - timestamp
+      - badseq
+      - badack
+    aggressive:
+      - badsum
+      - autottl
+      - md5sig
+      - timestamp
+      - badseq
+      - badack
+      - badsum_autottl
+      - md5sig_autottl
+  ipfrag_positions_tcp:
+    - 8
+    - 16
+    - 24
+    - 32
+    - 48
+    - 64
+    - 96
+  ipfrag_positions_udp:
+    - 8
+    - 16
+    - 32
+    - 64
+    - 96
+  seqovl_lengths:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - midsld-1
+  fake_repeats:
+    - 1
+    - 2
+    - 5
+    - 10
+    - 20
+  wsize_values:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+  wscale_values:
+    - 0
+    - 1
+    - 2
+    - 4
+    - 6
+
+# Global Bayesian defaults. Family-level priors may override these.
+bayes_defaults:
+  alpha_beta_prior: [2, 2]
+  update_weights:
+    success_alpha: 1.0
+    soft_fail_beta: 1.0
+    timeout_beta: 0.7
+    tls_error_beta: 0.8
+    hard_strategy_fail_beta: 2.0
+    infrastructure_failure_beta: 0.0
+  penalties:
+    cost: 0.03
+    risk: 0.04
+    expected_time: 0.02
+
+# Cost/risk scale:
+# 1 = cheapest/safest, 10 = most expensive/risky.
+families:
+  - id: baseline
+    enabled: true
+    category: control
+    protocols: [http, tls12, tls13, quic]
+    cost: 0
+    risk: 0
+    prior: [1, 1]
+    description: "Direct probe without nfqws2/firewall rule. Used for target classification."
+    actions:
+      - id: direct
+        backend: native
+        no_nfqws: true
+        no_firewall: true
+
+  - id: http_trick
+    enabled: true
+    category: http_header_modification
+    protocols: [http]
+    cost: 1
+    risk: 1
+    prior: [3, 3]
+    description: "HTTP request header and line-ending manipulations."
+    actions:
+      - id: http_hostcase
+        function: http_hostcase
+        params:
+          spell:
+            type: categorical
+            values: [HoSt, hoSt, HOST, hOSt]
+            default: HoSt
+        render:
+          lua_desync: "http_hostcase:spell={{spell}}"
+      - id: http_domcase
+        function: http_domcase
+        params: {}
+        render:
+          lua_desync: "http_domcase"
+      - id: http_methodeol
+        function: http_methodeol
+        params: {}
+        render:
+          lua_desync: "http_methodeol"
+      - id: http_unixeol
+        function: http_unixeol
+        params: {}
+        render:
+          lua_desync: "http_unixeol"
+
+  - id: wsize
+    enabled: true
+    category: tcp_window_rewrite
+    protocols: [tls12, tls13, http]
+    cost: 7
+    risk: 5
+    prior: [1, 4]
+    description: "TCP window-size/window-scale manipulation. Usually fallback, especially for TLS 1.2."
+    caveats:
+      - "Can degrade throughput. Prefer as last resort."
+    actions:
+      - id: wsize
+        function: wsize
+        params:
+          wsize:
+            type: integer
+            ordered: true
+            values_ref: constants.wsize_values
+          scale:
+            type: integer
+            ordered: true
+            values_ref: constants.wscale_values
+        render:
+          lua_desync: "wsize:wsize={{wsize}}:scale={{scale}}"
+      - id: wssize
+        function: wssize
+        params:
+          wsize:
+            type: integer
+            ordered: true
+            values_ref: constants.wsize_values
+          scale:
+            type: integer
+            ordered: true
+            values_ref: constants.wscale_values
+        render:
+          lua_desync: "wssize:wsize={{wsize}}:scale={{scale}}"
+
+  - id: fake
+    enabled: true
+    category: direct_fake_packet
+    protocols: [http, tls12, tls13, quic, udp_generic]
+    cost: 3
+    risk: 2
+    prior: [3, 3]
+    description: "Direct fake payload packet(s); does not drop original packet."
+    actions:
+      - id: fake_http
+        function: fake
+        protocols: [http]
+        params:
+          blob:
+            type: blob_ref
+            values: [fake_default_http]
+            default: fake_default_http
+          fooling:
+            type: fooling_set
+            values_ref: constants.fooling_sets.common
+          repeats:
+            type: integer
+            ordered: true
+            values: [1, 2, 3]
+            default: 1
+        render:
+          lua_desync: "fake:payload=http_req:blob={{blob}}{{fooling_suffix}}"
+      - id: fake_tls
+        function: fake
+        protocols: [tls12, tls13]
+        params:
+          blob:
+            type: blob_ref
+            values: [fake_default_tls]
+            default: fake_default_tls
+          tls_mod:
+            type: categorical
+            values: [none, random_sni, random_session_id]
+            default: none
+          fooling:
+            type: fooling_set
+            values_ref: constants.fooling_sets.common
+        render:
+          lua_desync: "fake:payload=tls_client_hello:blob={{blob}}{{tls_mod_suffix}}{{fooling_suffix}}"
+      - id: fake_quic
+        function: fake
+        protocols: [quic]
+        params:
+          blob:
+            type: blob_ref
+            values: [fake_default_quic]
+            default: fake_default_quic
+          repeats:
+            type: integer
+            ordered: true
+            values_ref: constants.fake_repeats
+          fooling:
+            type: fooling_set
+            values: [none, autottl]
+        numeric_search:
+          method: coarse_refine
+          ordered_param: repeats
+        render:
+          lua_desync: "fake:payload=quic_initial:blob={{blob}}:repeats={{repeats}}{{fooling_suffix}}"
+      - id: fake_udp_generic
+        function: fake
+        protocols: [udp_generic]
+        params:
+          blob:
+            type: blob_ref
+            values: [fake_default_udp]
+            default: fake_default_udp
+          repeats:
+            type: integer
+            ordered: true
+            values_ref: constants.fake_repeats
+          fooling:
+            type: fooling_set
+            values: [none, autottl]
+        render:
+          lua_desync: "fake:payload=udp:blob={{blob}}:repeats={{repeats}}{{fooling_suffix}}"
+
+  - id: syndata
+    enabled: true
+    category: tcp_syn_payload_fake
+    protocols: [http, tls12, tls13]
+    cost: 6
+    risk: 5
+    prior: [1, 4]
+    description: "Fake payload in SYN path; topology-sensitive."
+    caveats:
+      - "Use only when TCP SYN manipulation is applicable."
+    actions:
+      - id: syndata_http
+        function: syndata
+        protocols: [http]
+        params:
+          blob:
+            type: blob_ref
+            values: [fake_default_http]
+            default: fake_default_http
+          fooling:
+            type: fooling_set
+            values_ref: constants.fooling_sets.common
+        render:
+          lua_desync: "syndata:blob={{blob}}{{fooling_suffix}}"
+      - id: syndata_tls
+        function: syndata
+        protocols: [tls12, tls13]
+        params:
+          blob:
+            type: blob_ref
+            values: [fake_default_tls]
+            default: fake_default_tls
+          fooling:
+            type: fooling_set
+            values_ref: constants.fooling_sets.common
+        render:
+          lua_desync: "syndata:blob={{blob}}{{fooling_suffix}}"
+
+  - id: rst
+    enabled: false
+    category: tcp_rst_fake
+    protocols: [http, tls12, tls13]
+    cost: 6
+    risk: 6
+    prior: [1, 5]
+    description: "Fake RST/RSTACK packet. Disabled by default due to high breakage risk."
+    actions:
+      - id: rst
+        function: rst
+        params:
+          rstack:
+            type: boolean
+            values: [false, true]
+            default: false
+          fooling:
+            type: fooling_set
+            values_ref: constants.fooling_sets.aggressive
+        render:
+          lua_desync: "rst{{rstack_suffix}}{{fooling_suffix}}"
+
+  - id: split
+    enabled: true
+    category: tcp_segmentation
+    protocols: [http, tls12, tls13]
+    cost: 2
+    risk: 1
+    prior: [4, 2]
+    description: "TCP segmentation in original order. Primary low-cost family."
+    actions:
+      - id: multisplit_http
+        function: multisplit
+        protocols: [http]
+        params:
+          pos:
+            type: discrete_list
+            ordered: true
+            values_ref: constants.split_positions.http_core
+          fooling:
+            type: fooling_set
+            values_ref: constants.fooling_sets.safe
+        numeric_search:
+          method: coarse_newton_local
+          ordered_param: pos
+        render:
+          lua_desync: "multisplit:payload=http_req:pos={{pos}}{{fooling_suffix}}"
+      - id: multisplit_tls
+        function: multisplit
+        protocols: [tls12, tls13]
+        params:
+          pos:
+            type: discrete_list
+            ordered: true
+            values_ref: constants.split_positions.tls_core
+          fooling:
+            type: fooling_set
+            values_ref: constants.fooling_sets.safe
+        numeric_search:
+          method: coarse_newton_local
+          ordered_param: pos
+        render:
+          lua_desync: "multisplit:payload=tls_client_hello:pos={{pos}}{{fooling_suffix}}"
+      - id: multisplit_multi_pos_http
+        function: multisplit
+        protocols: [http]
+        params:
+          pos:
+            type: discrete_list
+            values:
+              - method+2,midsld
+              - host,midsld
+              - host,endhost
+              - method+2,host,endhost
+        render:
+          lua_desync: "multisplit:payload=http_req:pos={{pos}}"
+      - id: multisplit_multi_pos_tls
+        function: multisplit
+        protocols: [tls12, tls13]
+        params:
+          pos:
+            type: discrete_list
+            values:
+              - 2,midsld
+              - sniext+1,midsld
+              - host+1,midsld
+              - sniext+1,host+1,endhost-1
+        render:
+          lua_desync: "multisplit:payload=tls_client_hello:pos={{pos}}"
+
+  - id: disorder
+    enabled: true
+    category: tcp_segmentation_reverse_order
+    protocols: [http, tls12, tls13]
+    cost: 3
+    risk: 2
+    prior: [3, 2]
+    description: "TCP segmentation with reverse segment sending order."
+    actions:
+      - id: multidisorder_http
+        function: multidisorder
+        protocols: [http]
+        params:
+          pos:
+            type: discrete_list
+            ordered: true
+            values_ref: constants.split_positions.http_core
+          fooling:
+            type: fooling_set
+            values_ref: constants.fooling_sets.safe
+        numeric_search:
+          method: coarse_newton_local
+          ordered_param: pos
+        render:
+          lua_desync: "multidisorder:payload=http_req:pos={{pos}}{{fooling_suffix}}"
+      - id: multidisorder_tls
+        function: multidisorder
+        protocols: [tls12, tls13]
+        params:
+          pos:
+            type: discrete_list
+            ordered: true
+            values_ref: constants.split_positions.tls_core
+          fooling:
+            type: fooling_set
+            values_ref: constants.fooling_sets.safe
+        numeric_search:
+          method: coarse_newton_local
+          ordered_param: pos
+        render:
+          lua_desync: "multidisorder:payload=tls_client_hello:pos={{pos}}{{fooling_suffix}}"
+      - id: multidisorder_legacy_tls
+        function: multidisorder_legacy
+        protocols: [tls12, tls13]
+        params:
+          pos:
+            type: discrete_list
+            ordered: true
+            values_ref: constants.split_positions.tls_core
+        render:
+          lua_desync: "multidisorder_legacy:payload=tls_client_hello:pos={{pos}}"
+
+  - id: seqovl
+    enabled: true
+    category: tcp_sequence_overlap
+    protocols: [http, tls12, tls13]
+    cost: 5
+    risk: 3
+    prior: [2, 3]
+    description: "TCP sequence overlap, optionally combined with segmentation."
+    actions:
+      - id: multisplit_seqovl_http
+        function: multisplit
+        protocols: [http]
+        params:
+          pos:
+            type: discrete_list
+            values_ref: constants.split_positions.http_core
+          seqovl:
+            type: discrete
+            values_ref: constants.seqovl_lengths
+          seqovl_pattern:
+            type: blob_ref
+            values: [zero, random]
+            default: zero
+        render:
+          lua_desync: "multisplit:payload=http_req:pos={{pos}}:seqovl={{seqovl}}{{seqovl_pattern_suffix}}"
+      - id: multisplit_seqovl_tls
+        function: multisplit
+        protocols: [tls12, tls13]
+        params:
+          pos:
+            type: discrete_list
+            values_ref: constants.split_positions.tls_core
+          seqovl:
+            type: discrete
+            values_ref: constants.seqovl_lengths
+          seqovl_pattern:
+            type: blob_ref
+            values: [zero, random]
+            default: zero
+        render:
+          lua_desync: "multisplit:payload=tls_client_hello:pos={{pos}}:seqovl={{seqovl}}{{seqovl_pattern_suffix}}"
+      - id: tcpseg_seqovl
+        function: tcpseg
+        protocols: [http, tls12, tls13]
+        params:
+          pos:
+            type: discrete_pair
+            values:
+              - "0,-1"
+              - "0,midsld"
+              - "host,endhost"
+          seqovl:
+            type: discrete
+            values_ref: constants.seqovl_lengths
+        render:
+          lua_desync: "tcpseg:pos={{pos}}:seqovl={{seqovl}}"
+
+  - id: faked_split
+    enabled: true
+    category: fake_interleaved_tcp_segmentation
+    protocols: [http, tls12, tls13]
+    cost: 4
+    risk: 3
+    prior: [2, 2]
+    description: "Interleaves fake and real TCP split parts. Requires fooling."
+    requires_signal_from: [split, fake]
+    actions:
+      - id: fakedsplit_http
+        function: fakedsplit
+        protocols: [http]
+        params:
+          pos:
+            type: discrete
+            ordered: true
+            values_ref: constants.split_positions.http_core
+          fooling:
+            type: fooling_set
+            values_ref: constants.fooling_sets.common
+          pattern:
+            type: blob_ref
+            values: [zero, random]
+            default: zero
+        render:
+          lua_desync: "fakedsplit:payload=http_req:pos={{pos}}{{fooling_suffix}}{{pattern_suffix}}"
+      - id: fakedsplit_tls
+        function: fakedsplit
+        protocols: [tls12, tls13]
+        params:
+          pos:
+            type: discrete
+            ordered: true
+            values_ref: constants.split_positions.tls_core
+          fooling:
+            type: fooling_set
+            values_ref: constants.fooling_sets.common
+          pattern:
+            type: blob_ref
+            values: [zero, random]
+            default: zero
+        render:
+          lua_desync: "fakedsplit:payload=tls_client_hello:pos={{pos}}{{fooling_suffix}}{{pattern_suffix}}"
+      - id: fakeddisorder_http
+        function: fakeddisorder
+        protocols: [http]
+        params:
+          pos:
+            type: discrete
+            ordered: true
+            values_ref: constants.split_positions.http_core
+          fooling:
+            type: fooling_set
+            values_ref: constants.fooling_sets.common
+          pattern:
+            type: blob_ref
+            values: [zero, random]
+            default: zero
+        render:
+          lua_desync: "fakeddisorder:payload=http_req:pos={{pos}}{{fooling_suffix}}{{pattern_suffix}}"
+      - id: fakeddisorder_tls
+        function: fakeddisorder
+        protocols: [tls12, tls13]
+        params:
+          pos:
+            type: discrete
+            ordered: true
+            values_ref: constants.split_positions.tls_core
+          fooling:
+            type: fooling_set
+            values_ref: constants.fooling_sets.common
+          pattern:
+            type: blob_ref
+            values: [zero, random]
+            default: zero
+        render:
+          lua_desync: "fakeddisorder:payload=tls_client_hello:pos={{pos}}{{fooling_suffix}}{{pattern_suffix}}"
+
+  - id: hostfake
+    enabled: true
+    category: fake_host_specific_split
+    protocols: [http, tls12, tls13]
+    cost: 5
+    risk: 4
+    prior: [2, 3]
+    description: "Host-aware fake split. Works on payloads with hostname: HTTP Host / TLS SNI."
+    requires_signal_from: [split, fake]
+    actions:
+      - id: hostfakesplit_http
+        function: hostfakesplit
+        protocols: [http]
+        params:
+          host:
+            type: string_template
+            values: [random.template, example.com, cdn.example.com]
+            default: random.template
+          midhost:
+            type: discrete
+            values: [midsld, host+1]
+          disorder_after:
+            type: discrete
+            values: [none, endhost, endhost+1]
+          fooling:
+            type: fooling_set
+            values_ref: constants.fooling_sets.common
+        render:
+          lua_desync: "hostfakesplit:payload=http_req:host={{host}}{{midhost_suffix}}{{disorder_after_suffix}}{{fooling_suffix}}"
+      - id: hostfakesplit_tls
+        function: hostfakesplit
+        protocols: [tls12, tls13]
+        params:
+          host:
+            type: string_template
+            values: [random.template, example.com, cdn.example.com]
+            default: random.template
+          midhost:
+            type: discrete
+            values: [midsld, host+1]
+          disorder_after:
+            type: discrete
+            values: [none, endhost, endhost+1]
+          fooling:
+            type: fooling_set
+            values_ref: constants.fooling_sets.common
+        render:
+          lua_desync: "hostfakesplit:payload=tls_client_hello:host={{host}}{{midhost_suffix}}{{disorder_after_suffix}}{{fooling_suffix}}"
+
+  - id: ipfrag
+    enabled: true
+    category: ip_fragmentation
+    protocols: [http, tls12, tls13, quic, udp_generic]
+    cost: 6
+    risk: 4
+    prior: [1, 3]
+    description: "IP-level fragmentation applied to emitted raw packets/fakes/segmentation."
+    actions:
+      - id: fake_ipfrag_tcp
+        function: fake
+        protocols: [http, tls12, tls13]
+        params:
+          blob:
+            type: blob_ref
+            values: [fake_default_http, fake_default_tls]
+          ipfrag_pos:
+            type: integer
+            ordered: true
+            values_ref: constants.ipfrag_positions_tcp
+          fooling:
+            type: fooling_set
+            values_ref: constants.fooling_sets.common
+        numeric_search:
+          method: coarse_refine
+          ordered_param: ipfrag_pos
+        render:
+          lua_desync: "fake:blob={{blob}}:ipfrag:ipfrag_pos_tcp={{ipfrag_pos}}{{fooling_suffix}}"
+      - id: multisplit_ipfrag_tcp
+        function: multisplit
+        protocols: [http, tls12, tls13]
+        params:
+          pos:
+            type: discrete
+            values: [midsld, host+1, sniext+1]
+          ipfrag_pos:
+            type: integer
+            ordered: true
+            values_ref: constants.ipfrag_positions_tcp
+        render:
+          lua_desync: "multisplit:pos={{pos}}:ipfrag:ipfrag_pos_tcp={{ipfrag_pos}}"
+      - id: fake_ipfrag_udp
+        function: fake
+        protocols: [quic, udp_generic]
+        params:
+          blob:
+            type: blob_ref
+            values: [fake_default_quic, fake_default_udp]
+          ipfrag_pos:
+            type: integer
+            ordered: true
+            values_ref: constants.ipfrag_positions_udp
+          repeats:
+            type: integer
+            values: [1, 2, 5]
+        numeric_search:
+          method: coarse_refine
+          ordered_param: ipfrag_pos
+        render:
+          lua_desync: "fake:blob={{blob}}:repeats={{repeats}}:ipfrag:ipfrag_pos_udp={{ipfrag_pos}}"
+
+  - id: oob
+    enabled: true
+    category: tcp_oob_urgent_pointer
+    protocols: [http, tls12, tls13]
+    cost: 7
+    risk: 5
+    prior: [1, 4]
+    description: "TCP urgent pointer/OOB manipulation. Last-resort TCP family."
+    caveats:
+      - "Do not combine blindly with segmentation families."
+    actions:
+      - id: oob_byte
+        function: oob
+        params:
+          byte:
+            type: integer
+            values: [0, 1, 13, 32, 255]
+          urp:
+            type: discrete
+            values: [b, e, host, midsld]
+          fooling:
+            type: fooling_set
+            values_ref: constants.fooling_sets.safe
+        render:
+          lua_desync: "oob:byte={{byte}}:urp={{urp}}{{fooling_suffix}}"
+      - id: oob_char
+        function: oob
+        params:
+          char:
+            type: string
+            values: [" ", "A", "0"]
+          urp:
+            type: discrete
+            values: [b, e, host, midsld]
+        render:
+          lua_desync: "oob:char={{char}}:urp={{urp}}"
+
+  - id: udp_len
+    enabled: true
+    category: udp_payload_length_modification
+    protocols: [quic, udp_generic]
+    cost: 5
+    risk: 4
+    prior: [2, 3]
+    description: "UDP length manipulation. Useful only for selected UDP protocols and conditions."
+    actions:
+      - id: udplen_increase
+        function: udplen
+        protocols: [quic, udp_generic]
+        params:
+          increment:
+            type: integer
+            ordered: true
+            values: [1, 2, 4, 8, 16, 32]
+          min:
+            type: integer
+            values: [0, 8, 16]
+            default: 0
+          max:
+            type: integer
+            values: [0, 1200, 1500]
+            default: 0
+          pattern:
+            type: blob_ref
+            values: [zero, random]
+            default: zero
+        render:
+          lua_desync: "udplen:increment={{increment}}:min={{min}}:max={{max}}{{pattern_suffix}}"
+      - id: udplen_decrease
+        function: udplen
+        protocols: [udp_generic]
+        params:
+          increment:
+            type: integer
+            ordered: true
+            values: [-1, -2, -4]
+        render:
+          lua_desync: "udplen:increment={{increment}}"
+
+  - id: dht
+    enabled: false
+    category: udp_dht_specific
+    protocols: [udp_generic]
+    cost: 4
+    risk: 3
+    prior: [1, 3]
+    description: "DHT-specific UDP manipulation; disabled unless testing DHT traffic."
+    actions:
+      - id: dht_dn
+        function: dht_dn
+        params: {}
+        render:
+          lua_desync: "dht_dn"
+
+  - id: ipv6_ext
+    enabled: true
+    category: ipv6_extension_headers
+    protocols: [http, tls12, tls13, quic, udp_generic]
+    ip_versions: [6]
+    cost: 4
+    risk: 3
+    prior: [2, 3]
+    description: "IPv6 extension header fooling. Only for IPv6 targets."
+    actions:
+      - id: ip6_hopbyhop
+        function: pktmod
+        ip_versions: [6]
+        params: {}
+        render:
+          lua_desync: "pktmod:ip6_hopbyhop"
+      - id: ip6_destopt
+        function: pktmod
+        ip_versions: [6]
+        params: {}
+        render:
+          lua_desync: "pktmod:ip6_destopt"
+      - id: ip6_hopbyhop_destopt
+        function: pktmod
+        ip_versions: [6]
+        params: {}
+        render:
+          lua_desync: "pktmod:ip6_hopbyhop:ip6_destopt"
+
+  - id: synack
+    enabled: false
+    category: tcp_handshake_confusion
+    protocols: [http, tls12, tls13]
+    cost: 8
+    risk: 8
+    prior: [1, 5]
+    description: "TCB turnaround / split-handshake methods. Disabled by default."
+    caveats:
+      - "synack breaks NAT; use only in supported topology."
+      - "synack_split is server-side oriented."
+    topology_requires:
+      nat: false
+    actions:
+      - id: synack
+        function: synack
+        params:
+          ipfrag_pos:
+            type: integer
+            values_ref: constants.ipfrag_positions_tcp
+            optional: true
+        render:
+          lua_desync: "synack{{ipfrag_suffix}}"
+      - id: synack_split_syn
+        function: synack_split
+        params:
+          mode:
+            type: categorical
+            values: [syn]
+        render:
+          lua_desync: "synack_split:mode=syn"
+      - id: synack_split_synack
+        function: synack_split
+        params:
+          mode:
+            type: categorical
+            values: [synack]
+        render:
+          lua_desync: "synack_split:mode=synack"
+      - id: synack_split_acksyn
+        function: synack_split
+        params:
+          mode:
+            type: categorical
+            values: [acksyn]
+        render:
+          lua_desync: "synack_split:mode=acksyn"
+
+# Candidate generators provide recommended search subsets.
+# The optimizer can override these when running adaptive-force.
+candidate_generators:
+  signal:
+    http:
+      - family: http_trick
+        actions: [http_hostcase, http_domcase]
+      - family: split
+        actions: [multisplit_http]
+        params:
+          pos: [host, midsld]
+      - family: disorder
+        actions: [multidisorder_http]
+        params:
+          pos: [host, midsld]
+      - family: fake
+        actions: [fake_http]
+        params:
+          fooling: [badsum, autottl]
+      - family: seqovl
+        actions: [multisplit_seqovl_http]
+        params:
+          pos: [midsld]
+          seqovl: [1, midsld-1]
+    tls13:
+      - family: split
+        actions: [multisplit_tls]
+        params:
+          pos: [sniext+1, host+1, midsld]
+      - family: disorder
+        actions: [multidisorder_tls]
+        params:
+          pos: [sniext+1, host+1, midsld]
+      - family: fake
+        actions: [fake_tls]
+        params:
+          fooling: [badsum, autottl]
+      - family: faked_split
+        actions: [fakedsplit_tls]
+        params:
+          pos: [midsld]
+          fooling: [badsum]
+      - family: seqovl
+        actions: [multisplit_seqovl_tls]
+        params:
+          pos: [midsld]
+          seqovl: [1, midsld-1]
+    tls12:
+      - family: split
+        actions: [multisplit_tls]
+        params:
+          pos: [sniext+1, host+1, midsld]
+      - family: disorder
+        actions: [multidisorder_tls]
+        params:
+          pos: [sniext+1, host+1, midsld]
+      - family: fake
+        actions: [fake_tls]
+        params:
+          fooling: [badsum, autottl]
+      - family: faked_split
+        actions: [fakedsplit_tls]
+        params:
+          pos: [midsld]
+          fooling: [badsum]
+      - family: wsize
+        actions: [wssize]
+        params:
+          wsize: [1, 2]
+          scale: [6]
+    quic:
+      - family: fake
+        actions: [fake_quic]
+        params:
+          repeats: [1, 5, 20]
+          fooling: [none, autottl]
+      - family: ipfrag
+        actions: [fake_ipfrag_udp]
+        params:
+          ipfrag_pos: [16, 32, 64]
+          repeats: [1]
+      - family: udp_len
+        actions: [udplen_increase]
+        params:
+          increment: [1, 4, 8]
+
+  expand:
+    http:
+      family_order: [http_trick, split, disorder, fake, faked_split, seqovl, hostfake, ipfrag, oob]
+    tls13:
+      family_order: [split, disorder, fake, faked_split, seqovl, hostfake, ipfrag, oob, ipv6_ext]
+    tls12:
+      family_order: [split, disorder, fake, faked_split, seqovl, ipfrag, wsize, hostfake, oob, ipv6_ext]
+    quic:
+      family_order: [fake, ipfrag, udp_len, ipv6_ext]
+
+# Transition matrix hints for local ordering. Values are abstract costs.
+# Lower cost means neighboring candidate in local TSP-like ordering.
+transition_costs:
+  default: 10
+  same_family: 1
+  same_action: 1
+  same_protocol: 1
+  different_protocol: 8
+  same_param_neighbor: 1
+  same_param_far: 3
+  family_matrix:
+    baseline:
+      http_trick: 1
+      split: 2
+      fake: 3
+    http_trick:
+      split: 2
+      fake: 3
+      disorder: 3
+    split:
+      disorder: 1
+      seqovl: 2
+      faked_split: 2
+      fake: 3
+      ipfrag: 5
+      oob: 7
+    disorder:
+      split: 1
+      faked_split: 2
+      seqovl: 3
+      fake: 3
+    fake:
+      faked_split: 2
+      hostfake: 3
+      ipfrag: 4
+      rst: 6
+    faked_split:
+      hostfake: 2
+      seqovl: 3
+      ipfrag: 4
+    seqovl:
+      split: 2
+      disorder: 3
+      ipfrag: 5
+    ipfrag:
+      fake: 4
+      udp_len: 4
+      ipv6_ext: 5
+    udp_len:
+      fake: 3
+      ipfrag: 4
+    wsize:
+      split: 4
+      fake: 5
+    oob:
+      split: 7
+      fake: 6
+    ipv6_ext:
+      ipfrag: 5
+      fake: 4
+
+# Rules to prevent combinatorial explosion.
+combo_rules:
+  - id: fake_plus_split
+    enabled: true
+    protocols: [http, tls12, tls13]
+    requires_signal_from_any: [fake, split]
+    combine_families: [fake, split]
+    max_combined_cost: 7
+    max_candidates: 12
+    render_mode: multiple_lua_desync
+  - id: fake_plus_disorder
+    enabled: true
+    protocols: [http, tls12, tls13]
+    requires_signal_from_any: [fake, disorder]
+    combine_families: [fake, disorder]
+    max_combined_cost: 8
+    max_candidates: 8
+    render_mode: multiple_lua_desync
+  - id: fake_plus_ipfrag_udp
+    enabled: true
+    protocols: [quic, udp_generic]
+    requires_signal_from_any: [fake, ipfrag]
+    combine_families: [fake, ipfrag]
+    max_combined_cost: 9
+    max_candidates: 8
+    render_mode: merged_if_possible
+  - id: split_plus_seqovl
+    enabled: true
+    protocols: [http, tls12, tls13]
+    requires_signal_from_any: [split, seqovl]
+    combine_families: [split, seqovl]
+    max_combined_cost: 8
+    max_candidates: 10
+    render_mode: merged_if_possible
+  - id: hostfake_after_split_or_fake
+    enabled: true
+    protocols: [http, tls12, tls13]
+    requires_signal_from_any: [split, fake]
+    combine_families: [hostfake]
+    max_combined_cost: 6
+    max_candidates: 6
+    render_mode: single_lua_desync
+
+# Early pruning policy. This does not affect infrastructure/target failures.
+pruning:
+  enabled: true
+  hard_gates:
+    dns_failure: stop_target
+    tcp_connect_failure: stop_tcp_protocols
+    no_quic_support: stop_quic
+  candidate:
+    prune_exact_candidate_after_hard_strategy_fail: 1
+    prune_exact_candidate_after_soft_fail: 2
+  family:
+    prune_family_after_independent_soft_fails: 3
+    prune_family_only_if_no_success: true
+  combo:
+    require_base_signal: true
+    skip_if_both_base_families_failed: true
+  infrastructure_failures:
+    update_bayes: false
+    count_as_strategy_failure: false
+
+# Default rendering conventions for nfqws2 strategy args.
+rendering:
+  nfqws2:
+    profile_args_template:
+      - "--filter-tcp={{tcp_ports}}"
+      - "--filter-udp={{udp_ports}}"
+      - "--filter-l7={{l7_filter}}"
+      - "--lua-desync={{lua_desync}}"
+    placeholders:
+      fooling_suffix:
+        none: ""
+        badsum: ":badsum"
+        autottl: ":autottl"
+        badsum_autottl: ":badsum:autottl"
+        md5sig: ":md5sig"
+        timestamp: ":timestamp"
+        badseq: ":badseq"
+        badack: ":badack"
+        md5sig_autottl: ":md5sig:autottl"
+      tls_mod_suffix:
+        none: ""
+        random_sni: ":tls_mod=random_sni"
+        random_session_id: ":tls_mod=random_session_id"
+      pattern_suffix:
+        zero: ""
+        random: ":pattern=random"
+      seqovl_pattern_suffix:
+        zero: ""
+        random: ":seqovl_pattern=random"
+      ipfrag_suffix:
+        none: ""
+
+# Output generation hints.
+selection_policy:
+  primary:
+    min_attempts: 3
+    min_success_rate: 0.8
+    min_posterior_mean: 0.75
+    prefer_lower_cost: true
+    prefer_lower_risk: true
+  fallback:
+    min_attempts: 2
+    min_success_rate: 0.6
+    min_posterior_mean: 0.55
+  minimization:
+    enabled: true
+    removal_priority:
+      - oob
+      - rst
+      - synack
+      - ipfrag
+      - wsize
+      - wssize
+      - badsum
+      - md5sig
+      - autottl
+      - fake
+      - seqovl
+      - disorder
+      - split
+      - http_trick

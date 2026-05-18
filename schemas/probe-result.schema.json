@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ProbeResult",
+  "type": "object",
+  "required": ["strategy_id", "worker_id", "target_host", "target_ip", "target_port", "protocol", "total_ms", "outcome", "bytes_read"],
+  "properties": {
+    "strategy_id": {"type": "string"},
+    "worker_id": {"type": "integer"},
+    "qnum": {"type": ["integer", "null"]},
+    "assigned_source_port": {"type": ["integer", "null"]},
+    "target_host": {"type": "string"},
+    "target_ip": {"type": "string"},
+    "target_port": {"type": "integer"},
+    "protocol": {"type": "string"},
+    "total_ms": {"type": "integer"},
+    "outcome": {"type": "string"},
+    "http_status": {"type": ["integer", "null"]},
+    "bytes_read": {"type": "integer"}
+  }
+}

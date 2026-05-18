@@ -1,0 +1,36 @@
+[package]
+name = "zapret-checker"
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+description = "Parallel adaptive DPI strategy checker for zapret2/nfqws2 with source-port NFQUEUE isolation"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive", "env"] }
+futures = "0.3"
+parking_lot = "0.12"
+rand = "0.8"
+rustls = "0.23"
+rustls-pki-types = "1"
+rustls-native-certs = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = "0.26"
+tokio-util = "0.7"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = "2"
+
+[dev-dependencies]
+rcgen = "0.13"
+tokio-test = "0.4"
+
+[[bin]]
+name = "zapret-checker"
+path = "src/main.rs"

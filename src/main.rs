@@ -1,0 +1,416 @@
+mod bayes;
+mod config;
+mod firewall;
+mod graph;
+mod nfqws;
+mod ordering;
+mod probe;
+mod pruning;
+mod queue;
+mod scheduler;
+mod scoring;
+mod types;
+mod worker;
+
+use bayes::BayesianState;
+use clap::{Parser, Subcommand};
+use config::AppConfig;
+use firewall::{FirewallHook, FirewallManager, IptablesFirewallManager, NftablesFirewallManager};
+use graph::StrategyGraph;
+use nfqws::ProcessNfqwsManager;
+use probe::{NativeTcpTlsHttpProbe, ProbeBackend};
+use pruning::PruningPolicy;
+use queue::QueueAllocator;
+use scoring::ScoreWeights;
+use serde::Serialize;
+use std::{net::ToSocketAddrs, path::PathBuf, sync::Arc};
+use tokio_util::sync::CancellationToken;
+use types::*;
+use worker::WorkerRuntime;
+
+#[derive(Parser, Debug)]
+#[command(name = "zapret-checker")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    Check {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        workers: Option<usize>,
+        #[arg(long)]
+        backend: Option<String>,
+        #[arg(long, visible_alias = "conf-dir", value_name = "DIR")]
+        strategies_dir: Option<PathBuf>,
+        #[arg(long, value_name = "FILE")]
+        bayes_state: Option<PathBuf>,
+        #[arg(long, value_name = "FILE")]
+        nfqws_binary: Option<PathBuf>,
+        #[arg(long, value_name = "DIR")]
+        nfqws_lib_dir: Vec<PathBuf>,
+    },
+    Baseline {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        host: String,
+    },
+    Cleanup {
+        #[arg(long)]
+        config: PathBuf,
+    },
+}
+
+#[derive(Debug, Serialize)]
+struct CheckOutput {
+    baseline: ProbeResult,
+    results: Vec<scheduler::StrategyRunResult>,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt().with_env_filter("info").init();
+    let cli = Cli::parse();
+    match cli.command {
+        Commands::Cleanup { config } => {
+            let cfg = AppConfig::load(&config)?;
+            let fw = build_firewall(&cfg);
+            fw.cleanup_all().await?;
+        }
+        Commands::Baseline { config, host } => {
+            let cfg = AppConfig::load(&config)?;
+            let ip = resolve_one(&host, 443)?;
+            let probe = NativeTcpTlsHttpProbe::new(
+                cfg.source_port.bind_ipv4,
+                cfg.source_port.bind_ipv6,
+                cfg.probe.max_read_bytes,
+                cfg.probe.user_agent.clone(),
+            );
+            let task = ProbeTask {
+                strategy_id: "baseline".into(),
+                worker_id: 0,
+                strategy_args: vec![],
+                target_host: host,
+                target_ip: ip,
+                target_port: 443,
+                protocol: ProbeProtocol::HttpsHttp11,
+                path: cfg.probe.path,
+                timeouts: ProbeTimeouts {
+                    connect_ms: cfg.probe.connect_timeout_ms,
+                    tls_ms: cfg.probe.tls_timeout_ms,
+                    first_byte_ms: cfg.probe.first_byte_timeout_ms,
+                    total_ms: cfg.probe.total_timeout_ms,
+                },
+            };
+            let ctx = ProbeContext {
+                qnum: 0,
+                cancellation: None,
+                baseline: true,
+            };
+            let r = ProbeBackend::probe(&probe, task, ctx).await;
+            println!("{}", serde_json::to_string_pretty(&r)?);
+        }
+        Commands::Check {
+            config,
+            host,
+            workers,
+            backend,
+            strategies_dir,
+            bayes_state,
+            nfqws_binary,
+            nfqws_lib_dir,
+        } => {
+            let cfg = AppConfig::load(&config)?;
+            let backend = backend.unwrap_or_else(|| cfg.probe.backend.clone());
+            let ip = resolve_one(&host, 443)?;
+            if backend == "curl" {
+                if !cfg.debug.enable_curl_fallback {
+                    anyhow::bail!(
+                        "--backend curl requires debug.enable_curl_fallback = true in config"
+                    );
+                }
+                let timeouts = ProbeTimeouts {
+                    connect_ms: cfg.probe.connect_timeout_ms,
+                    tls_ms: cfg.probe.tls_timeout_ms,
+                    first_byte_ms: cfg.probe.first_byte_timeout_ms,
+                    total_ms: cfg.probe.total_timeout_ms,
+                };
+                let task = ProbeTask {
+                    strategy_id: "curl-reference".into(),
+                    worker_id: 0,
+                    strategy_args: vec![],
+                    target_host: host,
+                    target_ip: ip,
+                    target_port: 443,
+                    protocol: ProbeProtocol::HttpsHttp11,
+                    path: cfg.probe.path,
+                    timeouts,
+                };
+                let ctx = ProbeContext {
+                    qnum: 0,
+                    cancellation: None,
+                    baseline: true,
+                };
+                let r = ProbeBackend::probe(&probe::CurlProbeFallback, task, ctx).await;
+                println!("{}", serde_json::to_string_pretty(&vec![r])?);
+                return Ok(());
+            }
+            if backend != "native" {
+                anyhow::bail!("unsupported backend: {backend}");
+            }
+            let cancellation = shutdown_token();
+            let native_probe = NativeTcpTlsHttpProbe::new(
+                cfg.source_port.bind_ipv4,
+                cfg.source_port.bind_ipv6,
+                cfg.probe.max_read_bytes,
+                cfg.probe.user_agent.clone(),
+            );
+            let timeouts = ProbeTimeouts {
+                connect_ms: cfg.probe.connect_timeout_ms,
+                tls_ms: cfg.probe.tls_timeout_ms,
+                first_byte_ms: cfg.probe.first_byte_timeout_ms,
+                total_ms: cfg.probe.total_timeout_ms,
+            };
+            let baseline = run_baseline_probe(
+                &native_probe,
+                host.clone(),
+                ip,
+                cfg.probe.path.clone(),
+                timeouts.clone(),
+                Some(cancellation.clone()),
+            )
+            .await;
+            if should_skip_strategies_after_baseline(&baseline) {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&CheckOutput {
+                        baseline,
+                        results: Vec::new(),
+                    })?
+                );
+                return Ok(());
+            }
+            let nfqws_binary = nfqws_binary.unwrap_or_else(|| cfg.nfqws.binary.clone());
+            validate_nfqws_binary(&nfqws_binary)?;
+            let nfqws_library_paths = nfqws_library_paths(&cfg, &nfqws_binary, nfqws_lib_dir);
+            validate_nfqws_library_paths(&nfqws_library_paths)?;
+            let fw = build_firewall(&cfg);
+            fw.setup().await?;
+            let qa = QueueAllocator::new(cfg.queue.base_qnum, cfg.queue.qnum_count)?;
+            let nfqws = Arc::new(ProcessNfqwsManager {
+                stop_timeout_ms: cfg.nfqws.stop_timeout_ms,
+            });
+            let runtime = WorkerRuntime {
+                queue_allocator: qa,
+                firewall: fw.clone(),
+                nfqws,
+                native_probe,
+                nfqws_binary,
+                nfqws_library_paths,
+                nfqws_base_args: cfg.nfqws.base_args.clone(),
+                nfqws_start_grace_ms: cfg.nfqws.start_grace_ms,
+                nfqws_log_stdout: cfg.nfqws.log_stdout || cfg.debug.verbose_nfqws,
+                nfqws_log_stderr: cfg.nfqws.log_stderr || cfg.debug.verbose_nfqws,
+                firewall_hook: parse_hook(&cfg.firewall.hook),
+            };
+            let (strategies_file, transition_matrix_file) =
+                strategy_paths(&cfg, strategies_dir.as_deref());
+            let graph = StrategyGraph::load(&strategies_file, &transition_matrix_file)?;
+            let scheduler = scheduler::Scheduler {
+                runtime,
+                workers_count: workers
+                    .unwrap_or(cfg.workers.count)
+                    .min(cfg.queue.qnum_count as usize)
+                    .max(1),
+                pruning_policy: PruningPolicy {
+                    soft_fail_family_limit: cfg.strategies.soft_fail_family_limit,
+                    combo_requires_signal: true,
+                },
+                score_weights: ScoreWeights::default(),
+            };
+            let bayes_path = bayes_state.unwrap_or_else(|| cfg.bayes.state_file.clone());
+            let mut bayes = BayesianState::load(&bayes_path)?;
+            let results = scheduler
+                .run_graph_with_bayes(
+                    host,
+                    ip,
+                    graph,
+                    cfg.probe.path,
+                    timeouts,
+                    cancellation,
+                    &mut bayes,
+                )
+                .await;
+            bayes.save(&bayes_path)?;
+            if cfg.firewall.cleanup_on_exit {
+                fw.cleanup_all().await?;
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&CheckOutput { baseline, results })?
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn run_baseline_probe(
+    probe: &NativeTcpTlsHttpProbe,
+    host: String,
+    ip: std::net::IpAddr,
+    path: String,
+    timeouts: ProbeTimeouts,
+    cancellation: Option<CancellationToken>,
+) -> ProbeResult {
+    let task = ProbeTask {
+        strategy_id: "baseline".into(),
+        worker_id: 0,
+        strategy_args: vec![],
+        target_host: host,
+        target_ip: ip,
+        target_port: 443,
+        protocol: ProbeProtocol::HttpsHttp11,
+        path,
+        timeouts,
+    };
+    let ctx = ProbeContext {
+        qnum: 0,
+        cancellation,
+        baseline: true,
+    };
+    ProbeBackend::probe(probe, task, ctx).await
+}
+
+fn should_skip_strategies_after_baseline(result: &ProbeResult) -> bool {
+    if result.failure_kind == Some(FailureKind::InfrastructureFailure) {
+        return true;
+    }
+    matches!(
+        result.outcome,
+        ProbeOutcome::NetworkUnreachable | ProbeOutcome::DnsFailure | ProbeOutcome::Refused
+    )
+}
+
+fn validate_nfqws_binary(path: &std::path::Path) -> anyhow::Result<()> {
+    let meta = std::fs::metadata(path)
+        .map_err(|e| anyhow::anyhow!("nfqws2 binary not found at {}: {e}", path.display()))?;
+    if !meta.is_file() {
+        anyhow::bail!("nfqws2 binary path is not a file: {}", path.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o111 == 0 {
+            anyhow::bail!("nfqws2 binary is not executable: {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn nfqws_library_paths(
+    cfg: &AppConfig,
+    nfqws_binary: &std::path::Path,
+    cli_paths: Vec<PathBuf>,
+) -> Vec<PathBuf> {
+    if !cli_paths.is_empty() {
+        return cli_paths;
+    }
+    if !cfg.nfqws.library_paths.is_empty() {
+        return cfg.nfqws.library_paths.clone();
+    }
+    nfqws_binary
+        .parent()
+        .map(|p| vec![p.to_path_buf()])
+        .unwrap_or_default()
+}
+
+fn validate_nfqws_library_paths(paths: &[PathBuf]) -> anyhow::Result<()> {
+    for path in paths {
+        let meta = std::fs::metadata(path).map_err(|e| {
+            anyhow::anyhow!("nfqws2 library path not found at {}: {e}", path.display())
+        })?;
+        if !meta.is_dir() {
+            anyhow::bail!("nfqws2 library path is not a directory: {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn build_firewall(cfg: &AppConfig) -> Arc<dyn FirewallManager> {
+    match cfg.firewall.backend.as_str() {
+        "iptables" => Arc::new(IptablesFirewallManager),
+        _ => Arc::new(NftablesFirewallManager {
+            table: cfg.firewall.table.clone(),
+            hook: parse_hook(&cfg.firewall.hook),
+            priority: cfg.firewall.priority.clone(),
+            cleanup_on_start: cfg.firewall.cleanup_on_start,
+        }),
+    }
+}
+
+fn parse_hook(s: &str) -> FirewallHook {
+    match s {
+        "postrouting" => FirewallHook::Postrouting,
+        _ => FirewallHook::Output,
+    }
+}
+
+fn resolve_one(host: &str, port: u16) -> anyhow::Result<std::net::IpAddr> {
+    Ok((host, port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no address"))?
+        .ip())
+}
+
+fn strategy_paths(cfg: &AppConfig, strategies_dir: Option<&std::path::Path>) -> (PathBuf, PathBuf) {
+    match strategies_dir {
+        Some(dir) => (
+            dir.join("strategies.yaml"),
+            dir.join("transition_matrix.yaml"),
+        ),
+        None => default_strategy_paths(cfg),
+    }
+}
+
+fn default_strategy_paths(cfg: &AppConfig) -> (PathBuf, PathBuf) {
+    if cfg.strategies.file.exists() && cfg.strategies.transition_matrix.exists() {
+        (
+            cfg.strategies.file.clone(),
+            cfg.strategies.transition_matrix.clone(),
+        )
+    } else {
+        (
+            PathBuf::from("config/standart/strategies.yaml"),
+            PathBuf::from("config/standart/transition_matrix.yaml"),
+        )
+    }
+}
+
+fn shutdown_token() -> CancellationToken {
+    let token = CancellationToken::new();
+    let ctrl_c = token.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        ctrl_c.cancel();
+    });
+    #[cfg(unix)]
+    {
+        let sigterm = token.clone();
+        tokio::spawn(async move {
+            if let Ok(mut signal) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            {
+                let _ = signal.recv().await;
+                sigterm.cancel();
+            }
+        });
+    }
+    token
+}

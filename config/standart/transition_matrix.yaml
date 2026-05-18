@@ -1,0 +1,672 @@
+version: 1
+kind: transition_matrix
+description: >
+  Transition cost model for zapret2 adaptive strategy checker.
+  Used by TSP-like local ordering to minimize expensive jumps between
+  strategy families while still allowing fallback exploration.
+
+metadata:
+  compatible_with:
+    - strategies.yaml
+  cost_scale:
+    min: 0
+    max: 100
+    meaning:
+      0: same candidate / no transition
+      1-10: nearly identical strategy
+      11-25: same family or close neighbor
+      26-45: related family
+      46-70: expensive semantic jump
+      71-100: last-resort / disruptive jump
+
+defaults:
+  unknown_transition_cost: 65
+  same_candidate_cost: 0
+  same_family_cost: 10
+  same_protocol_cost: 25
+  cross_protocol_cost: 80
+  disabled_strategy_cost: 100
+
+weights:
+  transition_cost: 1.0
+  strategy_cost_delta: 0.35
+  strategy_risk_delta: 0.55
+  bayes_bonus: 0.75
+  same_family_bonus: -8
+  same_action_bonus: -5
+  same_param_space_bonus: -6
+  same_protocol_bonus: -4
+  recent_success_bonus: -10
+  recent_failure_penalty: 8
+  infrastructure_failure_penalty: 0
+
+protocol_transition_costs:
+  http:
+    http: 0
+    tls12: 55
+    tls13: 55
+    quic: 85
+  tls12:
+    http: 55
+    tls12: 0
+    tls13: 20
+    quic: 75
+  tls13:
+    http: 55
+    tls12: 20
+    tls13: 0
+    quic: 75
+  quic:
+    http: 85
+    tls12: 75
+    tls13: 75
+    quic: 0
+
+family_order_hint:
+  http:
+    - baseline
+    - http_trick
+    - split
+    - disorder
+    - fake
+    - fakedsplit
+    - fakeddisorder
+    - seqovl
+    - fake_split
+    - ipfrag_tcp
+    - oob
+  tls12:
+    - baseline
+    - split
+    - disorder
+    - fake
+    - fakedsplit
+    - fakeddisorder
+    - seqovl
+    - fake_split
+    - ipfrag_tcp
+    - wssize
+    - oob
+    - synack
+    - synack_split
+  tls13:
+    - baseline
+    - split
+    - disorder
+    - fake
+    - fakedsplit
+    - fakeddisorder
+    - seqovl
+    - fake_split
+    - ipfrag_tcp
+    - oob
+  quic:
+    - baseline
+    - udp_fake
+    - udp_ipfrag
+    - udp_fake_ipfrag
+    - udplen
+    - ipv6_ext
+
+families:
+  baseline:
+    baseline: 0
+    http_trick: 10
+    split: 14
+    disorder: 18
+    fake: 22
+    udp_fake: 18
+    seqovl: 34
+    ipfrag_tcp: 48
+    udp_ipfrag: 42
+    oob: 62
+    wssize: 68
+
+  http_trick:
+    baseline: 10
+    http_trick: 6
+    split: 16
+    disorder: 22
+    fake: 28
+    fakedsplit: 34
+    fake_split: 32
+    seqovl: 42
+    ipfrag_tcp: 55
+    oob: 70
+
+  split:
+    baseline: 14
+    http_trick: 16
+    split: 7
+    disorder: 11
+    fake: 24
+    fakedsplit: 16
+    fakeddisorder: 20
+    fake_split: 18
+    seqovl: 25
+    ipfrag_tcp: 46
+    oob: 64
+    wssize: 58
+    synack_split: 75
+
+  disorder:
+    baseline: 18
+    http_trick: 22
+    split: 11
+    disorder: 8
+    fake: 25
+    fakedsplit: 20
+    fakeddisorder: 16
+    fake_split: 20
+    seqovl: 22
+    ipfrag_tcp: 44
+    oob: 61
+    wssize: 58
+
+  fake:
+    baseline: 22
+    http_trick: 28
+    split: 24
+    disorder: 25
+    fake: 9
+    fakedsplit: 15
+    fakeddisorder: 17
+    fake_split: 14
+    seqovl: 31
+    ipfrag_tcp: 43
+    oob: 54
+    wssize: 62
+    udp_fake: 28
+    udp_fake_ipfrag: 50
+    syndata: 24
+    rst: 30
+
+  fakedsplit:
+    split: 16
+    disorder: 20
+    fake: 15
+    fakedsplit: 9
+    fakeddisorder: 12
+    fake_split: 10
+    seqovl: 25
+    ipfrag_tcp: 42
+    oob: 58
+
+  fakeddisorder:
+    split: 20
+    disorder: 16
+    fake: 17
+    fakedsplit: 12
+    fakeddisorder: 9
+    fake_split: 11
+    seqovl: 24
+    ipfrag_tcp: 40
+    oob: 56
+
+  fake_split:
+    split: 18
+    disorder: 20
+    fake: 14
+    fakedsplit: 10
+    fakeddisorder: 11
+    fake_split: 8
+    seqovl: 23
+    ipfrag_tcp: 40
+    oob: 55
+    wssize: 58
+
+  seqovl:
+    baseline: 34
+    split: 25
+    disorder: 22
+    fake: 31
+    fakedsplit: 25
+    fakeddisorder: 24
+    fake_split: 23
+    seqovl: 10
+    ipfrag_tcp: 38
+    oob: 47
+    wssize: 54
+
+  ipfrag_tcp:
+    baseline: 48
+    http_trick: 55
+    split: 46
+    disorder: 44
+    fake: 43
+    fakedsplit: 42
+    fakeddisorder: 40
+    fake_split: 40
+    seqovl: 38
+    ipfrag_tcp: 12
+    oob: 35
+    wssize: 50
+    synack: 65
+    synack_split: 68
+
+  oob:
+    baseline: 62
+    http_trick: 70
+    split: 64
+    disorder: 61
+    fake: 54
+    fakedsplit: 58
+    fakeddisorder: 56
+    fake_split: 55
+    seqovl: 47
+    ipfrag_tcp: 35
+    oob: 14
+    wssize: 52
+    synack: 70
+
+  wssize:
+    baseline: 68
+    split: 58
+    disorder: 58
+    fake: 62
+    fake_split: 58
+    seqovl: 54
+    ipfrag_tcp: 50
+    oob: 52
+    wssize: 10
+    synack: 80
+    synack_split: 82
+
+  udp_fake:
+    baseline: 18
+    fake: 28
+    udp_fake: 8
+    udp_ipfrag: 24
+    udp_fake_ipfrag: 14
+    udplen: 28
+    ipv6_ext: 38
+
+  udp_ipfrag:
+    baseline: 42
+    udp_fake: 24
+    udp_ipfrag: 10
+    udp_fake_ipfrag: 12
+    udplen: 25
+    ipv6_ext: 28
+
+  udp_fake_ipfrag:
+    udp_fake: 14
+    udp_ipfrag: 12
+    udp_fake_ipfrag: 10
+    udplen: 20
+    ipv6_ext: 26
+
+  udplen:
+    udp_fake: 28
+    udp_ipfrag: 25
+    udp_fake_ipfrag: 20
+    udplen: 10
+    ipv6_ext: 30
+
+  ipv6_ext:
+    udp_fake: 38
+    udp_ipfrag: 28
+    udp_fake_ipfrag: 26
+    udplen: 30
+    ipv6_ext: 8
+    ipfrag_tcp: 45
+
+  syndata:
+    fake: 24
+    syndata: 10
+    rst: 18
+    split: 45
+    disorder: 45
+    seqovl: 35
+    oob: 55
+
+  rst:
+    fake: 30
+    syndata: 18
+    rst: 10
+    seqovl: 40
+    oob: 52
+
+  synack:
+    ipfrag_tcp: 65
+    oob: 70
+    wssize: 80
+    synack: 12
+    synack_split: 15
+
+  synack_split:
+    split: 75
+    ipfrag_tcp: 68
+    synack: 15
+    synack_split: 12
+    wssize: 82
+
+action_transition_costs:
+  # HTTP tricks
+  http_hostcase:
+    http_hostcase: 0
+    http_domcase: 8
+    http_methodeol: 10
+    http_unixeol: 10
+    multisplit: 18
+    multidisorder: 24
+  http_domcase:
+    http_hostcase: 8
+    http_domcase: 0
+    http_methodeol: 12
+    http_unixeol: 12
+    multisplit: 18
+  http_methodeol:
+    http_hostcase: 10
+    http_domcase: 12
+    http_methodeol: 0
+    http_unixeol: 5
+    multisplit: 20
+  http_unixeol:
+    http_hostcase: 10
+    http_domcase: 12
+    http_methodeol: 5
+    http_unixeol: 0
+    multisplit: 20
+
+  # TCP split/disorder/fake family
+  multisplit:
+    multisplit: 0
+    multidisorder: 8
+    fakedsplit: 12
+    fakeddisorder: 18
+    fake: 24
+    seqovl: 22
+    ipfrag: 46
+  multidisorder:
+    multisplit: 8
+    multidisorder: 0
+    fakedsplit: 18
+    fakeddisorder: 12
+    fake: 24
+    seqovl: 20
+    ipfrag: 44
+  fake:
+    fake: 0
+    fakedsplit: 10
+    fakeddisorder: 12
+    multisplit: 24
+    multidisorder: 24
+    seqovl: 30
+    ipfrag: 43
+    udplen: 35
+  fakedsplit:
+    fake: 10
+    multisplit: 12
+    multidisorder: 18
+    fakedsplit: 0
+    fakeddisorder: 8
+    seqovl: 22
+  fakeddisorder:
+    fake: 12
+    multisplit: 18
+    multidisorder: 12
+    fakedsplit: 8
+    fakeddisorder: 0
+    seqovl: 22
+  seqovl:
+    multisplit: 22
+    multidisorder: 20
+    fake: 30
+    fakedsplit: 22
+    fakeddisorder: 22
+    seqovl: 0
+    ipfrag: 38
+    oob: 45
+  ipfrag:
+    multisplit: 46
+    multidisorder: 44
+    fake: 43
+    seqovl: 38
+    ipfrag: 0
+    oob: 30
+  oob:
+    fake: 54
+    seqovl: 45
+    ipfrag: 30
+    oob: 0
+  wssize:
+    multisplit: 58
+    multidisorder: 58
+    fake: 62
+    seqovl: 54
+    ipfrag: 50
+    wssize: 0
+
+  # UDP/QUIC
+  udp_fake:
+    udp_fake: 0
+    udp_ipfrag: 22
+    udp_fake_ipfrag: 10
+    udplen: 25
+    ipv6_ext: 35
+  udp_ipfrag:
+    udp_fake: 22
+    udp_ipfrag: 0
+    udp_fake_ipfrag: 10
+    udplen: 20
+    ipv6_ext: 26
+  udp_fake_ipfrag:
+    udp_fake: 10
+    udp_ipfrag: 10
+    udp_fake_ipfrag: 0
+    udplen: 18
+    ipv6_ext: 24
+  udplen:
+    udp_fake: 25
+    udp_ipfrag: 20
+    udp_fake_ipfrag: 18
+    udplen: 0
+    ipv6_ext: 28
+  ipv6_ext:
+    udp_fake: 35
+    udp_ipfrag: 26
+    udp_fake_ipfrag: 24
+    udplen: 28
+    ipv6_ext: 0
+
+param_transition_costs:
+  split_pos:
+    default_same_param_cost: 0
+    default_neighbor_cost: 4
+    default_non_neighbor_cost: 12
+    ordered_sets:
+      http:
+        values: [method+2, host, midsld]
+        neighbor_cost: 5
+        non_neighbor_cost: 12
+      tls:
+        values: [1, 2, sniext+1, sniext+4, host+1, midsld, endhost-1]
+        neighbor_cost: 4
+        non_neighbor_cost: 13
+
+  ipfrag_pos:
+    default_same_param_cost: 0
+    default_neighbor_cost: 5
+    default_non_neighbor_cost: 15
+    ordered_values: [4, 8, 16, 32, 48, 64, 96]
+
+  repeats:
+    default_same_param_cost: 0
+    default_neighbor_cost: 4
+    default_non_neighbor_cost: 14
+    ordered_values: [1, 2, 5, 10, 20, 30]
+
+  seqovl_len:
+    default_same_param_cost: 0
+    default_neighbor_cost: 5
+    default_non_neighbor_cost: 15
+    ordered_values: [1, 2, 4, 8, 16]
+
+  wssize:
+    default_same_param_cost: 0
+    default_neighbor_cost: 6
+    default_non_neighbor_cost: 18
+    ordered_values: [1, 2, 4, 8, 16]
+
+  fooling:
+    default_same_param_cost: 0
+    pair_costs:
+      none:
+        badsum: 10
+        md5sig: 14
+        autottl: 12
+        hopbyhop: 18
+        destopt: 18
+      badsum:
+        none: 10
+        md5sig: 12
+        autottl: 14
+      md5sig:
+        none: 14
+        badsum: 12
+        autottl: 16
+      autottl:
+        none: 12
+        badsum: 14
+        md5sig: 16
+
+tsp_local_ordering:
+  enabled: true
+  method: nearest_neighbor_2opt
+  window_size: 24
+  max_2opt_iterations: 32
+  preserve_protocol_groups: true
+  preserve_target_groups: true
+  avoid_cross_protocol_jumps: true
+  seed_order:
+    - baseline
+    - cheap
+    - medium
+    - fallback
+    - aggressive
+
+  edge_cost_formula: >
+    edge_cost =
+      family_transition_cost
+      + action_transition_cost * 0.40
+      + param_transition_cost * 0.35
+      + protocol_transition_cost * 0.50
+      + abs(cost_a - cost_b) * strategy_cost_delta
+      + abs(risk_a - risk_b) * strategy_risk_delta
+      - bayes_bonus_if_promising
+      + penalties
+
+adaptive_adjustments:
+  on_success:
+    same_family_next_bonus: -15
+    same_param_neighbors_bonus: -10
+    combo_with_successful_family_bonus: -8
+    expensive_fallback_penalty: 12
+  on_partial:
+    same_family_next_bonus: -8
+    neighbor_params_bonus: -6
+    combo_with_partial_bonus: -5
+  on_soft_failure:
+    same_exact_candidate_penalty: 20
+    same_family_small_penalty: 5
+    neighbor_params_penalty: 3
+  on_hard_strategy_failure:
+    same_exact_candidate_penalty: 45
+    same_family_penalty: 12
+    combo_using_candidate_penalty: 20
+  on_infrastructure_failure:
+    do_not_update_strategy_score: true
+    retry_later_penalty: 0
+  on_target_failure:
+    pause_target: true
+    do_not_update_strategy_score: true
+
+early_pruning:
+  enabled: true
+  do_not_prune:
+    - baseline
+  rules:
+    - id: prune_exact_candidate_after_hard_strategy_fail
+      scope: candidate
+      condition:
+        hard_strategy_failures: ">= 1"
+      action: deprioritize
+      penalty: 45
+
+    - id: prune_family_after_independent_soft_failures
+      scope: family
+      condition:
+        soft_failures: ">= 3"
+        successes: "== 0"
+        independent_params: ">= 2"
+      action: deprioritize
+      penalty: 25
+
+    - id: skip_combo_without_signal
+      scope: combo
+      condition:
+        combo_requires_signal: true
+        base_family_success_or_partial: false
+      action: delay_to_audit
+      penalty: 35
+
+    - id: avoid_aggressive_before_medium_exhausted
+      scope: family
+      families:
+        - ipfrag_tcp
+        - oob
+        - wssize
+        - synack
+        - synack_split
+      condition:
+        medium_families_have_signal: true
+      action: delay
+      penalty: 30
+
+    - id: do_not_penalize_infrastructure_failure
+      scope: candidate
+      condition:
+        failure_kind: InfrastructureFailure
+      action: no_score_update
+      penalty: 0
+
+fallback_paths:
+  http:
+    - [baseline, http_trick, split, disorder, fake, fakedsplit, seqovl, fake_split, ipfrag_tcp, oob]
+    - [baseline, split, fake, fake_split, seqovl, ipfrag_tcp, oob]
+  tls13:
+    - [baseline, split, disorder, fake, fakedsplit, fakeddisorder, seqovl, fake_split, ipfrag_tcp, oob]
+    - [baseline, fake, split, fake_split, seqovl, ipfrag_tcp, oob]
+  tls12:
+    - [baseline, split, disorder, fake, fakedsplit, fakeddisorder, seqovl, fake_split, ipfrag_tcp, wssize, oob]
+    - [baseline, fake, split, fake_split, seqovl, wssize, ipfrag_tcp, oob]
+  quic:
+    - [baseline, udp_fake, udp_ipfrag, udp_fake_ipfrag, udplen, ipv6_ext]
+    - [baseline, udp_ipfrag, udp_fake, udp_fake_ipfrag, ipv6_ext, udplen]
+
+audit_policy:
+  enabled: true
+  run_after_primary_found: false
+  audit_repeats: 1
+  include:
+    - delayed_combos
+    - expensive_fallbacks
+    - low_posterior_but_unseen
+  exclude:
+    - disabled
+    - unsupported_protocol
+    - target_hard_fail
+
+rendering_hints:
+  strategy_key_fields:
+    - protocol
+    - family
+    - action
+    - params
+  matrix_lookup_order:
+    - exact_candidate_pair
+    - action_transition_costs
+    - family_transition_costs
+    - protocol_transition_costs
+    - defaults.unknown_transition_cost

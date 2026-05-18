@@ -1,0 +1,555 @@
+version: 1
+kind: bayesian_priors
+description: >
+  Baseline Bayesian priors and update policy for zapret2 adaptive DPI strategy checker.
+  These values are intentionally weak-to-moderate priors. Runtime observations stored
+  in state.json should dominate after several probes.
+
+metadata:
+  compatible_with:
+    - strategies.full.yaml
+    - transition_matrix.full.yaml
+  model:
+    distribution: beta_bernoulli
+    sampler: thompson_sampling
+    unit: strategy_candidate
+  beta_pair_format: [alpha, beta]
+  notes:
+    - Higher alpha means stronger initial belief in success.
+    - Higher beta means stronger initial belief in failure.
+    - Keep alpha+beta modest to avoid overfitting initial assumptions.
+    - InfrastructureFailure must not update Bayesian strategy priors.
+    - TargetFailure should not update strategy priors unless baseline shows target is reachable.
+
+global:
+  enabled: true
+  sampler: thompson
+  random_seed: null
+
+  default_prior: [2.0, 2.0]
+  unknown_strategy_prior: [1.5, 2.5]
+  disabled_strategy_prior: [1.0, 8.0]
+
+  confidence:
+    primary_threshold_mean: 0.80
+    fallback_threshold_mean: 0.60
+    discard_threshold_mean: 0.30
+    min_attempts_primary: 3
+    min_attempts_fallback: 2
+    credible_interval:
+      enabled: true
+      lower_bound_quantile: 0.20
+      primary_lower_bound_min: 0.70
+      fallback_lower_bound_min: 0.50
+
+  decay:
+    enabled: true
+    mode: per_run
+    decay_per_run: 0.85
+    decay_per_day: 0.95
+    floor_alpha: 1.0
+    floor_beta: 1.0
+    max_alpha: 80.0
+    max_beta: 80.0
+
+  scoring_penalties:
+    cost: 0.030
+    risk: 0.040
+    expected_time: 0.020
+    transition_cost: 0.006
+    instability: 0.100
+    recent_failure: 0.050
+    recent_success_bonus: 0.050
+
+  thompson_sampling:
+    exploration_floor: 0.03
+    fallback_exploration_rate: 0.08
+    max_consecutive_same_family: 6
+    reserve_budget_for_fallback_families: true
+
+outcome_updates:
+  # Increment values applied to Beta(alpha, beta).
+  # These are deliberately fractional so noisy failures do not dominate too early.
+  Success:
+    alpha: 1.00
+    beta: 0.00
+    family_alpha: 0.70
+    family_beta: 0.00
+
+  PartialSuccess:
+    alpha: 0.55
+    beta: 0.20
+    family_alpha: 0.40
+    family_beta: 0.10
+
+  Timeout:
+    alpha: 0.00
+    beta: 0.70
+    family_alpha: 0.00
+    family_beta: 0.40
+
+  TcpReset:
+    alpha: 0.00
+    beta: 0.90
+    family_alpha: 0.00
+    family_beta: 0.50
+
+  TlsAlert:
+    alpha: 0.00
+    beta: 0.80
+    family_alpha: 0.00
+    family_beta: 0.45
+
+  HttpBlockPage:
+    alpha: 0.00
+    beta: 1.00
+    family_alpha: 0.00
+    family_beta: 0.60
+
+  EmptyResponse:
+    alpha: 0.00
+    beta: 0.65
+    family_alpha: 0.00
+    family_beta: 0.35
+
+  Refused:
+    alpha: 0.00
+    beta: 0.00
+    family_alpha: 0.00
+    family_beta: 0.00
+    classification: TargetFailure
+
+  NetworkUnreachable:
+    alpha: 0.00
+    beta: 0.00
+    family_alpha: 0.00
+    family_beta: 0.00
+    classification: TargetFailure
+
+  DnsFailure:
+    alpha: 0.00
+    beta: 0.00
+    family_alpha: 0.00
+    family_beta: 0.00
+    classification: TargetFailure
+
+  InfrastructureFailure:
+    alpha: 0.00
+    beta: 0.00
+    family_alpha: 0.00
+    family_beta: 0.00
+    classification: InfrastructureFailure
+
+  Cancelled:
+    alpha: 0.00
+    beta: 0.00
+    family_alpha: 0.00
+    family_beta: 0.00
+    classification: Cancelled
+
+  InternalError:
+    alpha: 0.00
+    beta: 0.00
+    family_alpha: 0.00
+    family_beta: 0.00
+    classification: InfrastructureFailure
+
+failure_kind_policy:
+  StrategyFailure:
+    update_candidate: true
+    update_family: true
+    update_protocol: true
+  InfrastructureFailure:
+    update_candidate: false
+    update_family: false
+    update_protocol: false
+    retry_allowed: true
+  TargetFailure:
+    update_candidate: false
+    update_family: false
+    update_protocol: false
+    pause_target: true
+  Cancelled:
+    update_candidate: false
+    update_family: false
+    update_protocol: false
+
+family_priors:
+  baseline:
+    prior: [6.0, 2.0]
+    cost: 0
+    risk: 0
+    comment: Direct connection baseline. Not a DPI bypass strategy.
+
+  http_trick:
+    prior: [3.0, 3.0]
+    cost: 1
+    risk: 1
+    comment: Cheap HTTP header/request-line modifications.
+
+  split:
+    prior: [4.0, 2.0]
+    cost: 2
+    risk: 1
+    comment: TCP segmentation around Host/SNI. Good default family.
+
+  disorder:
+    prior: [3.5, 2.5]
+    cost: 3
+    risk: 2
+    comment: Similar to split but slightly riskier.
+
+  fake:
+    prior: [3.0, 3.0]
+    cost: 3
+    risk: 2
+    comment: Fake packet family, depends strongly on DPI behavior.
+
+  fakedsplit:
+    prior: [2.5, 2.5]
+    cost: 4
+    risk: 2
+    comment: Combination-like fake and split behavior.
+
+  fakeddisorder:
+    prior: [2.5, 2.7]
+    cost: 4
+    risk: 3
+    comment: Combination-like fake and disorder behavior.
+
+  fake_split:
+    prior: [2.4, 2.6]
+    cost: 5
+    risk: 3
+    comment: Explicit fake plus split/disorder combinations.
+
+  seqovl:
+    prior: [2.0, 3.0]
+    cost: 5
+    risk: 3
+    comment: TCP sequence overlap. More specific and more risky.
+
+  ipfrag_tcp:
+    prior: [1.5, 3.5]
+    cost: 6
+    risk: 4
+    comment: TCP IP fragmentation fallback.
+
+  oob:
+    prior: [1.2, 4.0]
+    cost: 7
+    risk: 5
+    comment: Out-of-band TCP technique, aggressive fallback.
+
+  wssize:
+    prior: [1.2, 4.0]
+    cost: 8
+    risk: 5
+    comment: TLS1.2/server-side DPI fallback. Potential performance impact.
+
+  udp_fake:
+    prior: [3.0, 3.0]
+    cost: 3
+    risk: 2
+    comment: QUIC/UDP fake packet family.
+
+  udp_ipfrag:
+    prior: [2.0, 3.0]
+    cost: 5
+    risk: 3
+    comment: UDP IP fragmentation.
+
+  udp_fake_ipfrag:
+    prior: [2.0, 3.0]
+    cost: 6
+    risk: 4
+    comment: QUIC fake plus fragmentation.
+
+  udplen:
+    prior: [1.8, 3.2]
+    cost: 5
+    risk: 3
+    comment: UDP length manipulation.
+
+  ipv6_ext:
+    prior: [1.8, 3.2]
+    cost: 5
+    risk: 3
+    comment: IPv6 extension headers. IPv6-only.
+
+  syndata:
+    prior: [1.5, 3.5]
+    cost: 6
+    risk: 4
+    comment: SYN-data related strategy. Disabled or late by default.
+
+  rst:
+    prior: [1.5, 3.8]
+    cost: 6
+    risk: 4
+    comment: RST-related fake/desync family. Late fallback.
+
+  synack:
+    prior: [1.0, 5.0]
+    cost: 9
+    risk: 6
+    comment: Special mode, disabled by default.
+
+  synack_split:
+    prior: [1.0, 5.0]
+    cost: 9
+    risk: 6
+    comment: Special mode, disabled by default.
+
+protocol_priors:
+  http:
+    baseline: [4.0, 3.0]
+    http_trick: [3.5, 2.8]
+    split: [3.5, 2.5]
+    disorder: [3.0, 2.7]
+    fake: [2.8, 3.0]
+    fakedsplit: [2.4, 2.8]
+    fakeddisorder: [2.3, 2.9]
+    seqovl: [2.0, 3.0]
+    ipfrag_tcp: [1.5, 3.5]
+    oob: [1.2, 4.0]
+
+  tls12:
+    baseline: [3.0, 4.0]
+    split: [3.8, 2.4]
+    disorder: [3.4, 2.6]
+    fake: [3.0, 3.0]
+    fakedsplit: [2.6, 2.6]
+    fakeddisorder: [2.5, 2.8]
+    fake_split: [2.4, 2.8]
+    seqovl: [2.0, 3.0]
+    ipfrag_tcp: [1.5, 3.5]
+    wssize: [1.4, 4.0]
+    oob: [1.2, 4.0]
+
+  tls13:
+    baseline: [3.0, 4.0]
+    split: [4.2, 2.2]
+    disorder: [3.6, 2.4]
+    fake: [3.1, 2.9]
+    fakedsplit: [2.7, 2.5]
+    fakeddisorder: [2.6, 2.7]
+    fake_split: [2.5, 2.8]
+    seqovl: [2.0, 3.0]
+    ipfrag_tcp: [1.5, 3.5]
+    oob: [1.2, 4.0]
+
+  quic:
+    baseline: [3.0, 4.0]
+    udp_fake: [3.2, 2.8]
+    udp_ipfrag: [2.3, 3.0]
+    udp_fake_ipfrag: [2.2, 3.1]
+    udplen: [1.8, 3.2]
+    ipv6_ext: [1.8, 3.2]
+
+action_priors:
+  # HTTP tricks
+  http_hostcase: [3.2, 3.0]
+  http_domcase: [3.0, 3.0]
+  http_methodeol: [2.5, 3.2]
+  http_unixeol: [2.5, 3.2]
+
+  # TCP segmentation / disorder
+  multisplit: [4.2, 2.2]
+  multidisorder: [3.5, 2.5]
+  fakedsplit: [2.8, 2.6]
+  fakeddisorder: [2.6, 2.8]
+  hostfakesplit: [2.4, 3.0]
+
+  # Fake and fooling
+  fake: [3.0, 3.0]
+  syndata: [1.5, 3.5]
+  rst: [1.5, 3.8]
+
+  # TCP special/fallback
+  seqovl: [2.0, 3.0]
+  ipfrag: [1.6, 3.4]
+  oob: [1.2, 4.0]
+  wssize: [1.3, 4.0]
+  synack: [1.0, 5.0]
+  synack_split: [1.0, 5.0]
+
+  # UDP/QUIC
+  udp_fake: [3.1, 2.9]
+  udp_ipfrag: [2.2, 3.1]
+  udp_fake_ipfrag: [2.1, 3.1]
+  udplen: [1.8, 3.2]
+  ip6_hopbyhop: [1.8, 3.2]
+  ip6_destopt: [1.8, 3.2]
+
+parameter_priors:
+  split_pos:
+    http:
+      method+2: [2.8, 3.0]
+      host: [3.6, 2.6]
+      midsld: [3.8, 2.4]
+    tls:
+      "1": [2.2, 3.2]
+      "2": [2.5, 3.0]
+      sniext+1: [3.7, 2.4]
+      sniext+4: [3.4, 2.6]
+      host+1: [3.5, 2.5]
+      midsld: [4.0, 2.2]
+      endhost-1: [3.0, 2.8]
+
+  ipfrag_pos:
+    "4": [1.3, 3.8]
+    "8": [1.8, 3.2]
+    "16": [2.1, 3.0]
+    "32": [2.2, 3.0]
+    "48": [1.9, 3.2]
+    "64": [1.8, 3.3]
+    "96": [1.4, 3.8]
+
+  repeats:
+    "1": [2.8, 3.0]
+    "2": [3.1, 2.8]
+    "5": [3.0, 2.8]
+    "10": [2.6, 3.0]
+    "20": [2.2, 3.3]
+    "30": [1.8, 3.8]
+
+  seqovl_len:
+    "1": [1.8, 3.2]
+    "2": [2.0, 3.0]
+    "4": [2.1, 3.0]
+    "8": [1.9, 3.2]
+    "16": [1.6, 3.5]
+
+  wssize:
+    "1": [1.5, 3.6]
+    "2": [1.6, 3.5]
+    "4": [1.6, 3.5]
+    "8": [1.4, 3.8]
+    "16": [1.2, 4.0]
+
+  fooling:
+    none: [2.8, 2.8]
+    badsum: [2.4, 3.0]
+    md5sig: [2.2, 3.1]
+    autottl: [2.6, 2.9]
+    hopbyhop: [1.8, 3.3]
+    destopt: [1.8, 3.3]
+
+context_multipliers:
+  # Multipliers are applied to pseudo-count deltas or priors, depending on implementation.
+  ip_version:
+    ipv4:
+      alpha_multiplier: 1.00
+      beta_multiplier: 1.00
+    ipv6:
+      alpha_multiplier: 0.95
+      beta_multiplier: 1.05
+      family_overrides:
+        ipv6_ext:
+          alpha_multiplier: 1.25
+          beta_multiplier: 0.90
+
+  target_port:
+    "80":
+      family_overrides:
+        http_trick:
+          alpha_multiplier: 1.20
+        split:
+          alpha_multiplier: 1.05
+    "443":
+      family_overrides:
+        split:
+          alpha_multiplier: 1.08
+        fake:
+          alpha_multiplier: 1.03
+
+  protocol:
+    tls13:
+      family_overrides:
+        split:
+          alpha_multiplier: 1.10
+        wssize:
+          beta_multiplier: 1.25
+    tls12:
+      family_overrides:
+        wssize:
+          alpha_multiplier: 1.05
+          beta_multiplier: 1.05
+    quic:
+      family_overrides:
+        udp_fake:
+          alpha_multiplier: 1.10
+        http_trick:
+          beta_multiplier: 2.0
+
+state_file_policy:
+  path: /etc/zapret2/adaptive/state.json
+  format: json
+  write_atomic: true
+  backup_previous: true
+  load_on_start: true
+  save_on_exit: true
+  save_after_each_result: false
+
+state_schema_hint:
+  example:
+    version: 1
+    updated_at: 1760000000
+    posteriors:
+      "tls13:ipv4:split:multisplit:midsld":
+        alpha: 12.0
+        beta: 3.0
+        tests: 15
+        successes: 11
+        failures: 4
+        last_success_at: 1760000000
+        last_failure_at: null
+
+candidate_key_policy:
+  key_fields:
+    - protocol
+    - ip_version
+    - family
+    - action
+    - params
+  normalize:
+    sort_params: true
+    lowercase_protocol: true
+    lowercase_family: true
+    lowercase_action: true
+
+selection_formula:
+  description: >
+    Suggested utility formula for choosing the next candidate.
+  formula: >
+    utility =
+      sample_beta(alpha, beta)
+      - cost_penalty * strategy_cost
+      - risk_penalty * strategy_risk
+      - expected_time_penalty * expected_time_score
+      - transition_cost_penalty * normalized_transition_cost
+      - instability_penalty * instability_score
+      + recent_success_bonus_if_applicable
+
+pruning_interaction:
+  low_posterior_policy:
+    enabled: true
+    discard_if_mean_below: 0.25
+    min_attempts_before_discard: 3
+    never_discard_if_unseen: true
+    move_to_audit_instead_of_delete: true
+
+  high_posterior_policy:
+    enabled: true
+    promote_if_mean_above: 0.75
+    min_attempts_before_promote: 2
+    confirm_repeats: 3
+
+  family_pruning:
+    enabled: true
+    prune_family_if:
+      posterior_mean_below: 0.30
+      min_independent_candidates_tested: 3
+      no_successes: true
+    action: delay_to_fallback_or_audit

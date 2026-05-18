@@ -1,0 +1,7 @@
+.idea
+target
+examples
+dist
+config/*
+!config/standart
+tmp

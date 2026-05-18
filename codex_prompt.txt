@@ -1,0 +1,256 @@
+Ты работаешь над Rust-проектом для проверки стратегий обхода DPI на Linux/OpenWrt.
+
+Цель проекта:
+Создать быстрый параллельный DPI strategy checker для zapret2/nfqws2.
+
+Основная архитектура:
+- Strategy Graph
+- Transition Cost Matrix
+- Bayesian Priors
+- Adaptive Scoring
+- TSP-like Local Ordering
+- Early Pruning
+- Parallel Workers
+- Native Rust Probe Backend
+- NFQUEUE isolation per active task
+- Exact source-port based firewall routing
+
+ВАЖНО:
+Текущий вариант не должен использовать shell curl как основной механизм проверки.
+curl допускается только как debug/fallback/reference backend.
+
+Нужно реализовать или доработать архитектуру так, чтобы каждая активная проверка стратегии была изолирована через:
+- отдельный TCP socket;
+- source port, автоматически выданный ОС через bind(0);
+- отдельный NFQUEUE qnum;
+- отдельный nfqws2 process instance;
+- временное firewall rule:
+  tcp sport <assigned_source_port> -> queue num <qnum>;
+- native TCP/TLS/HTTP probe.
+
+Ключевая модель source-port isolation:
+
+1. Native probe создаёт TCP socket.
+2. Socket bind’ится на local port 0.
+3. ОС выбирает свободный ephemeral source port.
+4. Checker получает этот порт через local_addr()/getsockname().
+5. Socket НЕ закрывается.
+6. Checker выделяет уникальный qnum для активной задачи.
+7. Запускается nfqws2 с этим qnum.
+8. Устанавливается firewall rule под конкретный assigned source port.
+9. connect() выполняется тем же socket, который уже удерживает source port.
+10. Выполняется TLS handshake и HTTP probe.
+11. Выполняется cleanup:
+    - снять firewall rule;
+    - остановить nfqws2;
+    - закрыть socket;
+    - освободить qnum.
+
+Критически важно:
+Нельзя делать bind(0), получить порт, закрыть socket, а потом пытаться заново bind’иться к этому порту.
+Порт должен удерживаться тем же socket’ом до connect() и окончания probe.
+Firewall rule должен быть установлен ДО connect().
+Не использовать заранее заданные source-port ranges как основной механизм.
+Не использовать fixed source port pool как основной механизм.
+Source port должен выдаваться ОС.
+qnum не вычислять напрямую из номера порта.
+Нужно использовать QueueAllocator: одна активная probe -> один уникальный qnum; qnum связывается с source_port через firewall rule; после завершения qnum возвращается в allocator.
+
+Основной pipeline worker’а:
+
+1. Worker получает StrategyTask.
+2. Создаёт TCP socket.
+3. Делает bind(local_ip:0).
+4. Получает assigned_source_port.
+5. Выделяет qnum через QueueAllocator.
+6. Запускает nfqws2 --qnum=<qnum> с аргументами стратегии.
+7. Устанавливает firewall rule: source_port=<assigned_source_port>, target_ip=<target_ip>, target_port=<target_port>, protocol=tcp, queue=<qnum>.
+8. Делает connect() тем же socket’ом.
+9. Выполняет TLS handshake с SNI=target_host.
+10. Отправляет HTTP/1.1 request с Host=target_host.
+11. Читает начало ответа.
+12. Формирует ProbeResult.
+13. В finally/defer/drop-scope выполняет cleanup: remove firewall rule; stop nfqws2; release qnum; close socket.
+14. Возвращает ProbeResult в scheduler/result aggregator.
+
+Требования к probe:
+- Реализовать native Rust probe без shell curl.
+- Использовать tokio, tokio::net::TcpSocket, tokio-rustls, rustls, webpki-roots или rustls-native-certs, async-trait, thiserror, tracing, tokio-util CancellationToken.
+- Native probe должен создавать socket, bind’иться к local port 0, сохранять assigned source port и не закрывать socket до окончания probe.
+- Подключаться к конкретному target IP.
+- TLS SNI должен использовать target_host, а не IP.
+- HTTP Host header должен использовать target_host.
+- Начать с HTTP/1.1.
+- Отправлять:
+
+GET / HTTP/1.1
+Host: <target_host>
+User-Agent: zapret-checker
+Connection: close
+
+- Поддерживать path из config/task.
+- Читать минимум начало ответа.
+- Извлекать HTTP status code.
+- Фиксировать bytes_read и тайминги: setup_ms, connect_ms, tls_ms, first_byte_ms, total_ms.
+- Поддерживать timeouts: connect_timeout_ms, tls_timeout_ms, first_byte_timeout_ms, total_timeout_ms.
+- Классифицировать ошибки.
+
+Probe backend abstraction:
+
+#[async_trait::async_trait]
+pub trait ProbeBackend: Send + Sync {
+    async fn probe(&self, task: ProbeTask, ctx: ProbeContext) -> ProbeResult;
+}
+
+Реализовать:
+- NativeTcpTlsHttpProbe — основной backend;
+- CurlProbeFallback — только debug/reference backend.
+
+Основные структуры данных должны быть совместимы с уже созданными src/types.rs:
+- StrategyTask
+- ProbeTask
+- ProbeContext
+- ProbeTimeouts
+- ProbeProtocol
+- ProbeResult
+- FailureKind
+- ProbeOutcome
+- ProbeErrorClass
+
+QueueAllocator:
+- configurable base_qnum;
+- configurable qnum_count;
+- каждый активный probe получает уникальный qnum;
+- qnum возвращается после завершения probe;
+- если qnum нет, worker ждёт или scheduler ограничивает concurrency;
+- qnum не должен вычисляться из source port;
+- allocator должен быть потокобезопасным для async workers.
+
+FirewallManager:
+
+#[async_trait::async_trait]
+pub trait FirewallManager: Send + Sync {
+    async fn setup(&self) -> Result<(), FirewallError>;
+    async fn install_worker_rule(&self, rule: WorkerFirewallRule) -> Result<(), FirewallError>;
+    async fn remove_worker_rule(&self, rule: WorkerFirewallRule) -> Result<(), FirewallError>;
+    async fn cleanup_all(&self) -> Result<(), FirewallError>;
+}
+
+Реализовать:
+- NftablesFirewallManager — основной для OpenWrt fw4/Linux;
+- IptablesFirewallManager — fallback/debug.
+
+Для native checker, который сам генерирует трафик на роутере, по умолчанию использовать output hook. Для forwarded LAN-клиентов предусмотреть postrouting hook как config.
+
+nftables требования:
+- отдельная table/chain checker’а;
+- cleanup_on_start;
+- cleanup_all;
+- правила должны матчить ip/ip6 daddr, tcp sport source_port, tcp dport target_port, queue num qnum bypass.
+
+nfqws2 process manager:
+
+#[async_trait::async_trait]
+pub trait NfqwsManager: Send + Sync {
+    async fn start(&self, cfg: NfqwsInstanceConfig) -> Result<NfqwsHandle, NfqwsError>;
+    async fn stop(&self, handle: NfqwsHandle) -> Result<(), NfqwsError>;
+}
+
+Требования:
+- запускать nfqws2 с конкретным --qnum=<qnum>;
+- передавать strategy_args;
+- хранить child process handle;
+- проверять, что процесс не завершился сразу;
+- stdout/stderr писать в tracing debug logs;
+- stop должен корректно завершать процесс;
+- kill после timeout;
+- путь к binary конфигурируемый.
+
+Scheduler integration:
+- scheduler выдаёт StrategyTask в worker pool;
+- concurrency ограничивается min(workers_count, qnum_count);
+- early pruning может отменять ещё не начатые задачи;
+- уже запущенные probe можно отменять через CancellationToken;
+- результат каждого probe обновляет adaptive scoring;
+- InfrastructureFailure не должен ухудшать Bayesian score стратегии;
+- TargetFailure должен отделяться от StrategyFailure;
+- StrategyFailure — только когда инфраструктура работала, target доступен, но стратегия не дала успешный результат;
+- Success повышает score/priors соответствующей стратегии;
+- Timeout классифицировать по baseline/check context.
+
+Baseline check:
+- предусмотреть baseline probe без nfqws2/без firewall rule;
+- если target недоступен напрямую по сетевым причинам, не считать все стратегии проваленными;
+- baseline должен быть отдельным режимом.
+
+Config:
+Поддерживать TOML/YAML. В архиве есть config/checker.toml.
+
+CLI:
+- zapret-checker check --config config.toml --host example.org
+- zapret-checker check --config config.toml --host example.org --workers 2
+- zapret-checker check --config config.toml --host example.org --backend native
+- zapret-checker check --config config.toml --host example.org --backend curl
+- zapret-checker baseline --config config.toml --host example.org
+- zapret-checker cleanup --config config.toml
+
+Logging:
+Использовать tracing. Логировать worker_id, strategy_id, qnum, assigned_source_port, target_host, target_ip, target_port, firewall hook, nfqws2 start/stop, firewall install/remove, connect_ms, tls_ms, first_byte_ms, total_ms, http_status, bytes_read, outcome, failure_kind, error_class, cancellation.
+
+Safety/cleanup:
+- cleanup_on_start удаляет старые table/chain/rules checker’а;
+- cleanup_on_exit удаляет активные rules;
+- SIGINT/SIGTERM инициируют graceful cancellation;
+- активные workers получают CancellationToken;
+- каждый worker снимает своё правило и останавливает свой nfqws2;
+- если graceful stop не сработал, nfqws2 kill после timeout;
+- не оставлять nfqws2 processes;
+- не оставлять nft/iptables rules.
+
+Tests:
+Unit tests:
+- QueueAllocator выдаёт уникальные qnum;
+- QueueAllocator не выдаёт больше qnum, чем доступно;
+- qnum возвращается после release;
+- HTTP status parser корректно парсит HTTP/1.1 200 OK, HTTP/1.0 403 Forbidden, invalid response;
+- ProbeOutcome mapping корректен;
+- InfrastructureFailure не считается StrategyFailure;
+- WorkerFirewallRule рендерит exact tcp sport, не range;
+- IPv4 nft rule использует ip daddr;
+- IPv6 nft rule использует ip6 daddr.
+
+Integration tests без root:
+- native probe к локальному HTTP server;
+- native probe к локальному TLS server;
+- bind(0) возвращает assigned source port;
+- prepared socket удерживает порт до connect;
+- timeout handling;
+- cancellation handling.
+
+Root-required tests пометить ignored:
+- nftables setup/install/remove;
+- iptables install/remove;
+- NFQUEUE worker isolation;
+- nfqws2 process lifecycle.
+
+Ограничения:
+- Не использовать shell curl как основной backend.
+- Не использовать source-port ranges как основной механизм.
+- Не использовать fixed source-port pool как основной механизм.
+- Не закрывать socket после bind(0) до connect().
+- Firewall rule должен ставиться до connect().
+- qnum должен выделяться allocator’ом, а не вычисляться из source port.
+- Не смешивать несколько активных probes в один qnum.
+- Не использовать один nfqws2 instance для разных активных стратегий.
+- Не менять пользовательские firewall rules напрямую.
+- Использовать отдельную checker table/chain.
+- Не делать DNS resolve в каждом worker.
+- Не блокировать tokio runtime тяжёлыми sync operation.
+- InfrastructureFailure не должен портить Bayesian/adaptive score стратегии.
+- TargetFailure должен отделяться от StrategyFailure.
+- Не оставлять firewall rules и nfqws2 processes после завершения.
+
+Ожидаемый результат:
+После реализации программа должна уметь параллельно проверять стратегии DPI обхода так, чтобы каждая активная проверка работала через source port, выданный ОС через bind(0), временное exact firewall rule по этому source port, уникальный NFQUEUE qnum, отдельный nfqws2 process и native Rust TCP/TLS/HTTP/1.1 probe.
+
+Результат каждой проверки должен быть структурированным ProbeResult, пригодным для adaptive scoring, Bayesian priors, pruning и дальнейшего ранжирования стратегий.
