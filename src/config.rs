@@ -44,6 +44,47 @@ pub struct ProbeConfig {
     pub max_read_bytes: usize,
     pub user_agent: String,
     pub path: String,
+
+    #[serde(default)]
+    pub protocols: ProtocolProbeConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProtocolProbeConfig {
+    #[serde(default = "default_true")]
+    pub http: bool,
+
+    #[serde(default = "default_true")]
+    pub tls12: bool,
+
+    #[serde(default = "default_true")]
+    pub tls13: bool,
+
+    #[serde(default)]
+    pub quic: bool,
+
+    #[serde(default = "default_preferred_protocol")]
+    pub preferred: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_preferred_protocol() -> String {
+    "tls13".to_string()
+}
+
+impl Default for ProtocolProbeConfig {
+    fn default() -> Self {
+        Self {
+            http: true,
+            tls12: true,
+            tls13: false,
+            quic: false,
+            preferred: "tls13".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -118,6 +159,20 @@ impl AppConfig {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        if !matches!(
+            self.probe.protocols.preferred.as_str(),
+            "http" | "tls12" | "tls13" | "quic"
+        ) {
+            anyhow::bail!("probe.protocols.preferred must be http, tls12, tls13 or quic");
+        }
+
+        if !self.probe.protocols.http
+            && !self.probe.protocols.tls12
+            && !self.probe.protocols.tls13
+            && !self.probe.protocols.quic
+        {
+            anyhow::bail!("at least one protocol probe must be enabled");
+        }
         if self.workers.count == 0 {
             anyhow::bail!("workers.count must be greater than zero");
         }

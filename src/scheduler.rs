@@ -18,6 +18,7 @@ pub struct Scheduler {
     pub workers_count: usize,
     pub pruning_policy: PruningPolicy,
     pub score_weights: ScoreWeights,
+    pub protocol: ProbeProtocol,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -86,8 +87,8 @@ impl Scheduler {
                         strategy_args: node.args.clone(),
                         target_host: host.clone(),
                         target_ip: ip,
-                        target_port: 443,
-                        protocol: ProbeProtocol::HttpsHttp11,
+                        target_port: self.protocol.default_port(),
+                        protocol: self.protocol,
                         path: path.clone(),
                         timeouts: timeouts.clone(),
                     };

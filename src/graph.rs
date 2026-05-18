@@ -19,26 +19,37 @@ pub struct StrategyGraph {
 }
 
 impl StrategyGraph {
-    pub fn load(strategies_path: &Path, transition_path: &Path) -> anyhow::Result<Self> {
+    pub fn ordered_seed(&self) -> Vec<StrategyNode> {
+        let mut n = self.nodes.clone();
+        n.sort_by(|a, b| a.cost.partial_cmp(&b.cost).unwrap());
+        n
+    }
+
+    pub fn load_for_protocol(
+        strategies_path: &Path,
+        transition_path: &Path,
+        protocol_key: &str,
+    ) -> anyhow::Result<Self> {
         let strategies_text = std::fs::read_to_string(strategies_path)?;
         let strategies_yaml: Value = serde_yaml::from_str(&strategies_text)?;
+
         let nodes = if let Some(strategies) = value_seq(&strategies_yaml, "strategies") {
             parse_simple_strategies(strategies)?
         } else {
-            parse_catalog_strategies(&strategies_yaml)?
+            parse_catalog_strategies(&strategies_yaml, protocol_key)?
         };
+
         let transition_text = std::fs::read_to_string(transition_path)?;
         let transition_cost = parse_transition_costs(&transition_text)?;
+
         Ok(Self {
             nodes,
             transition_cost,
         })
     }
 
-    pub fn ordered_seed(&self) -> Vec<StrategyNode> {
-        let mut n = self.nodes.clone();
-        n.sort_by(|a, b| a.cost.partial_cmp(&b.cost).unwrap());
-        n
+    pub fn load(strategies_path: &Path, transition_path: &Path) -> anyhow::Result<Self> {
+        Self::load_for_protocol(strategies_path, transition_path, "tls13")
     }
 }
 
@@ -72,41 +83,51 @@ fn parse_transition_costs(text: &str) -> anyhow::Result<HashMap<(String, String)
     Ok(out)
 }
 
-fn parse_catalog_strategies(root: &Value) -> anyhow::Result<Vec<StrategyNode>> {
+fn parse_catalog_strategies(root: &Value, protocol_key: &str) -> anyhow::Result<Vec<StrategyNode>> {
     let families = value_seq(root, "families")
         .ok_or_else(|| anyhow::anyhow!("strategy catalog missing strategies/families"))?;
+
     let actions = catalog_actions(families);
     let family_meta = catalog_family_meta(families);
+
     let candidates = root
         .get("candidate_generators")
         .and_then(|v| v.get("signal"))
-        .and_then(|v| v.get("tls12"))
+        .and_then(|v| v.get(protocol_key))
         .and_then(Value::as_sequence)
         .ok_or_else(|| {
-            anyhow::anyhow!("strategy catalog missing candidate_generators.signal.tls13")
+            anyhow::anyhow!("strategy catalog missing candidate_generators.signal.{protocol_key}")
         })?;
 
     let mut nodes = Vec::new();
+
     for candidate in candidates {
         let Some(family) = candidate.get("family").and_then(Value::as_str) else {
             continue;
         };
+
         let Some(action_ids) = candidate.get("actions").and_then(Value::as_sequence) else {
             continue;
         };
+
         for action_id in action_ids.iter().filter_map(Value::as_str) {
             let Some(lua_template) = actions.get(action_id) else {
                 continue;
             };
+
             let params = candidate.get("params");
             let lua = render_lua_desync(lua_template, params);
+            if lua.contains("{{") || lua.contains("}}") {
+                continue;
+            }
             let (cost, risk, prior) =
                 family_meta
                     .get(family)
                     .cloned()
                     .unwrap_or((5.0, 3.0, (2.0, 2.0)));
+
             nodes.push(StrategyNode {
-                id: format!("tls13_{family}_{action_id}_{}", nodes.len()),
+                id: format!("{protocol_key}_{family}_{action_id}_{}", nodes.len()),
                 family: family.to_string(),
                 args: vec![format!("--lua-desync={lua}")],
                 cost,
@@ -115,9 +136,11 @@ fn parse_catalog_strategies(root: &Value) -> anyhow::Result<Vec<StrategyNode>> {
             });
         }
     }
+
     if nodes.is_empty() {
-        anyhow::bail!("strategy catalog produced no concrete tls13 candidates");
+        anyhow::bail!("strategy catalog produced no concrete {protocol_key} candidates");
     }
+
     Ok(nodes)
 }
 

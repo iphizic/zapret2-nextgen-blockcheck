@@ -37,13 +37,21 @@ pub enum ProbeError {
     LocalAddr(std::io::Error),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsProbeVersion {
+    Tls12,
+    Tls13,
+}
+
 #[derive(Clone)]
 pub struct NativeTcpTlsHttpProbe {
     pub bind_ipv4: IpAddr,
     pub bind_ipv6: IpAddr,
     pub max_read_bytes: usize,
     pub user_agent: String,
-    tls_config: Arc<ClientConfig>,
+
+    tls12_config: Arc<ClientConfig>,
+    tls13_config: Arc<ClientConfig>,
     tls_config_error: Option<Arc<String>>,
 }
 
@@ -54,22 +62,31 @@ impl NativeTcpTlsHttpProbe {
         max_read_bytes: usize,
         user_agent: String,
     ) -> Self {
-        let (tls_config, tls_config_error) = build_tls_config(Vec::new());
+        let (tls12_config, tls12_error) = build_tls_config(Vec::new(), TlsProbeVersion::Tls12);
+
+        let (tls13_config, tls13_error) = build_tls_config(Vec::new(), TlsProbeVersion::Tls13);
+
         Self {
             bind_ipv4,
             bind_ipv6,
             max_read_bytes,
             user_agent,
-            tls_config: Arc::new(tls_config),
-            tls_config_error: tls_config_error.map(Arc::new),
+            tls12_config: Arc::new(tls12_config),
+            tls13_config: Arc::new(tls13_config),
+            tls_config_error: tls12_error.or(tls13_error).map(Arc::new),
         }
     }
 
     #[allow(dead_code)]
     pub fn with_extra_root_certs(mut self, certs: Vec<CertificateDer<'static>>) -> Self {
-        let (tls_config, tls_config_error) = build_tls_config(certs);
-        self.tls_config = Arc::new(tls_config);
-        self.tls_config_error = tls_config_error.map(Arc::new);
+        let (tls12_config, tls12_error) = build_tls_config(certs.clone(), TlsProbeVersion::Tls12);
+
+        let (tls13_config, tls13_error) = build_tls_config(certs, TlsProbeVersion::Tls13);
+
+        self.tls12_config = Arc::new(tls12_config);
+        self.tls13_config = Arc::new(tls13_config);
+        self.tls_config_error = tls12_error.or(tls13_error).map(Arc::new);
+
         self
     }
 
@@ -178,7 +195,8 @@ impl NativeTcpTlsHttpProbe {
                 )
                 .await
             }
-            ProbeProtocol::HttpsHttp11 => {
+
+            ProbeProtocol::Tls12Http11 => {
                 self.https_http11(
                     task,
                     ctx,
@@ -186,9 +204,24 @@ impl NativeTcpTlsHttpProbe {
                     stream,
                     total_start,
                     connect_ms,
+                    TlsProbeVersion::Tls12,
                 )
                 .await
             }
+
+            ProbeProtocol::Tls13Http11 => {
+                self.https_http11(
+                    task,
+                    ctx,
+                    prepared.assigned_source_port,
+                    stream,
+                    total_start,
+                    connect_ms,
+                    TlsProbeVersion::Tls13,
+                )
+                .await
+            }
+
             ProbeProtocol::QuicHttp3Future => failure(
                 &task,
                 ctx.qnum,
@@ -213,6 +246,7 @@ impl NativeTcpTlsHttpProbe {
         stream: tokio::net::TcpStream,
         total_start: Instant,
         connect_ms: Option<u64>,
+        tls_version: TlsProbeVersion,
     ) -> ProbeResult {
         let tls_start = Instant::now();
         if let Some(error) = &self.tls_config_error {
@@ -230,7 +264,12 @@ impl NativeTcpTlsHttpProbe {
                 None,
             );
         }
-        let connector = TlsConnector::from(self.tls_config.clone());
+        let tls_config = match tls_version {
+            TlsProbeVersion::Tls12 => self.tls12_config.clone(),
+            TlsProbeVersion::Tls13 => self.tls13_config.clone(),
+        };
+
+        let connector = TlsConnector::from(tls_config);
         let server_name = match ServerName::try_from(task.target_host.clone()) {
             Ok(s) => s,
             Err(e) => {
@@ -453,26 +492,35 @@ impl NativeTcpTlsHttpProbe {
 
 fn build_tls_config(
     extra_root_certs: Vec<CertificateDer<'static>>,
+    version: TlsProbeVersion,
 ) -> (ClientConfig, Option<String>) {
     let mut root_store = RootCertStore::empty();
+
     let cert_result = rustls_native_certs::load_native_certs();
     let error = if !cert_result.errors.is_empty() && cert_result.certs.is_empty() {
         Some(format!("{:?}", cert_result.errors))
     } else {
         None
     };
+
     for cert in cert_result.certs {
         let _ = root_store.add(cert);
     }
+
     for cert in extra_root_certs {
         let _ = root_store.add(cert);
     }
-    (
-        ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth(),
-        error,
-    )
+
+    let versions = match version {
+        TlsProbeVersion::Tls12 => vec![&rustls::version::TLS12],
+        TlsProbeVersion::Tls13 => vec![&rustls::version::TLS13],
+    };
+
+    let cfg = ClientConfig::builder_with_protocol_versions(&versions)
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    (cfg, error)
 }
 
 #[async_trait]
@@ -556,7 +604,8 @@ impl ProbeBackend for CurlProbeFallback {
         let start = Instant::now();
         let scheme = match task.protocol {
             ProbeProtocol::HttpPlain => "http",
-            ProbeProtocol::HttpsHttp11 => "https",
+            ProbeProtocol::Tls12Http11 => "https",
+            ProbeProtocol::Tls13Http11 => "https",
             ProbeProtocol::QuicHttp3Future => "https",
         };
         let path = if task.path.is_empty() {
@@ -573,26 +622,37 @@ impl ProbeBackend for CurlProbeFallback {
             "{}:{}:{}",
             task.target_host, task.target_port, task.target_ip
         );
+        let mut cmd = Command::new("curl");
+
+        cmd.arg("--silent")
+            .arg("--show-error")
+            .arg("--http1.1")
+            .arg("--resolve")
+            .arg(resolve)
+            .arg("--connect-timeout")
+            .arg(format!("{:.3}", task.timeouts.connect_ms as f64 / 1000.0))
+            .arg("--max-time")
+            .arg(format!("{:.3}", task.timeouts.total_ms as f64 / 1000.0))
+            .arg("--user-agent")
+            .arg("zapret-checker")
+            .arg("--output")
+            .arg("-")
+            .arg("--write-out")
+            .arg("\n%{http_code}");
+
+        match task.protocol {
+            ProbeProtocol::Tls12Http11 => {
+                cmd.arg("--tlsv1.2").arg("--tls-max").arg("1.2");
+            }
+            ProbeProtocol::Tls13Http11 => {
+                cmd.arg("--tlsv1.3").arg("--tls-max").arg("1.3");
+            }
+            _ => {}
+        }
+
         let output = timeout(
             Duration::from_millis(task.timeouts.total_ms),
-            Command::new("curl")
-                .arg("--silent")
-                .arg("--show-error")
-                .arg("--http1.1")
-                .arg("--resolve")
-                .arg(resolve)
-                .arg("--connect-timeout")
-                .arg(format!("{:.3}", task.timeouts.connect_ms as f64 / 1000.0))
-                .arg("--max-time")
-                .arg(format!("{:.3}", task.timeouts.total_ms as f64 / 1000.0))
-                .arg("--user-agent")
-                .arg("zapret-checker")
-                .arg("--output")
-                .arg("-")
-                .arg("--write-out")
-                .arg("\n%{http_code}")
-                .arg(url)
-                .output(),
+            cmd.arg(url).output(),
         )
         .await;
         let output = match output {

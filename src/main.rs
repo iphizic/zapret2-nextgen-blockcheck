@@ -54,6 +54,8 @@ enum Commands {
         nfqws_binary: Option<PathBuf>,
         #[arg(long, value_name = "DIR")]
         nfqws_lib_dir: Vec<PathBuf>,
+        #[arg(long, value_name = "PROTO")]
+        probe_protocol: Option<String>,
     },
     Baseline {
         #[arg(long)]
@@ -85,6 +87,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Baseline { config, host } => {
             let cfg = AppConfig::load(&config)?;
+            let protocol = ProbeProtocol::Tls12Http11;
             let ip = resolve_one(&host, 443)?;
             let probe = NativeTcpTlsHttpProbe::new(
                 cfg.source_port.bind_ipv4,
@@ -98,8 +101,8 @@ async fn main() -> anyhow::Result<()> {
                 strategy_args: vec![],
                 target_host: host,
                 target_ip: ip,
-                target_port: 443,
-                protocol: ProbeProtocol::HttpsHttp11,
+                protocol: protocol,
+                target_port: protocol.default_port(),
                 path: cfg.probe.path,
                 timeouts: ProbeTimeouts {
                     connect_ms: cfg.probe.connect_timeout_ms,
@@ -125,10 +128,13 @@ async fn main() -> anyhow::Result<()> {
             bayes_state,
             nfqws_binary,
             nfqws_lib_dir,
+            probe_protocol,
         } => {
             let cfg = AppConfig::load(&config)?;
             let backend = backend.unwrap_or_else(|| cfg.probe.backend.clone());
-            let ip = resolve_one(&host, 443)?;
+            let protocol = selected_protocol(&cfg, probe_protocol)?;
+            let port = protocol.default_port();
+            let ip = resolve_one(&host, port)?;
             if backend == "curl" {
                 if !cfg.debug.enable_curl_fallback {
                     anyhow::bail!(
@@ -147,8 +153,8 @@ async fn main() -> anyhow::Result<()> {
                     strategy_args: vec![],
                     target_host: host,
                     target_ip: ip,
-                    target_port: 443,
-                    protocol: ProbeProtocol::HttpsHttp11,
+                    protocol,
+                    target_port: protocol.default_port(),
                     path: cfg.probe.path,
                     timeouts,
                 };
@@ -184,6 +190,7 @@ async fn main() -> anyhow::Result<()> {
                 cfg.probe.path.clone(),
                 timeouts.clone(),
                 Some(cancellation.clone()),
+                protocol,
             )
             .await;
             if should_skip_strategies_after_baseline(&baseline) {
@@ -221,7 +228,11 @@ async fn main() -> anyhow::Result<()> {
             };
             let (strategies_file, transition_matrix_file) =
                 strategy_paths(&cfg, strategies_dir.as_deref());
-            let graph = StrategyGraph::load(&strategies_file, &transition_matrix_file)?;
+            let graph = StrategyGraph::load_for_protocol(
+                &strategies_file,
+                &transition_matrix_file,
+                protocol.catalog_key(),
+            )?;
             let scheduler = scheduler::Scheduler {
                 runtime,
                 workers_count: workers
@@ -233,6 +244,7 @@ async fn main() -> anyhow::Result<()> {
                     combo_requires_signal: true,
                 },
                 score_weights: ScoreWeights::default(),
+                protocol,
             };
             let bayes_path = bayes_state.unwrap_or_else(|| cfg.bayes.state_file.clone());
             let mut bayes = BayesianState::load(&bayes_path)?;
@@ -267,6 +279,7 @@ async fn run_baseline_probe(
     path: String,
     timeouts: ProbeTimeouts,
     cancellation: Option<CancellationToken>,
+    protocol: ProbeProtocol,
 ) -> ProbeResult {
     let task = ProbeTask {
         strategy_id: "baseline".into(),
@@ -275,7 +288,7 @@ async fn run_baseline_probe(
         target_host: host,
         target_ip: ip,
         target_port: 443,
-        protocol: ProbeProtocol::HttpsHttp11,
+        protocol,
         path,
         timeouts,
     };
@@ -311,6 +324,38 @@ fn validate_nfqws_binary(path: &std::path::Path) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn parse_probe_protocol(s: &str) -> anyhow::Result<ProbeProtocol> {
+    match s {
+        "http" => Ok(ProbeProtocol::HttpPlain),
+        "tls12" => Ok(ProbeProtocol::Tls12Http11),
+        "tls13" => Ok(ProbeProtocol::Tls13Http11),
+        "quic" => Ok(ProbeProtocol::QuicHttp3Future),
+        _ => anyhow::bail!("unsupported probe protocol: {s}"),
+    }
+}
+
+fn protocol_enabled(cfg: &AppConfig, p: ProbeProtocol) -> bool {
+    match p {
+        ProbeProtocol::HttpPlain => cfg.probe.protocols.http,
+        ProbeProtocol::Tls12Http11 => cfg.probe.protocols.tls12,
+        ProbeProtocol::Tls13Http11 => cfg.probe.protocols.tls13,
+        ProbeProtocol::QuicHttp3Future => cfg.probe.protocols.quic,
+    }
+}
+
+fn selected_protocol(cfg: &AppConfig, cli: Option<String>) -> anyhow::Result<ProbeProtocol> {
+    let p = parse_probe_protocol(
+        cli.as_deref()
+            .unwrap_or(cfg.probe.protocols.preferred.as_str()),
+    )?;
+
+    if !protocol_enabled(cfg, p) {
+        anyhow::bail!("selected protocol {:?} is disabled in config", p);
+    }
+
+    Ok(p)
 }
 
 fn nfqws_library_paths(

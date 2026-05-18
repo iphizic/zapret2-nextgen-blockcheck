@@ -3,9 +3,32 @@ use std::net::IpAddr;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ProbeProtocol {
-    HttpsHttp11,
     HttpPlain,
+    Tls12Http11,
+    Tls13Http11,
     QuicHttp3Future,
+}
+
+impl ProbeProtocol {
+    pub fn is_tls(self) -> bool {
+        matches!(self, Self::Tls12Http11 | Self::Tls13Http11)
+    }
+
+    pub fn catalog_key(self) -> &'static str {
+        match self {
+            Self::HttpPlain => "http",
+            Self::Tls12Http11 => "tls12",
+            Self::Tls13Http11 => "tls13",
+            Self::QuicHttp3Future => "quic",
+        }
+    }
+
+    pub fn default_port(self) -> u16 {
+        match self {
+            Self::HttpPlain => 80,
+            Self::Tls12Http11 | Self::Tls13Http11 | Self::QuicHttp3Future => 443,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
