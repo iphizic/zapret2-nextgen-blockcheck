@@ -9,7 +9,12 @@ pub fn tsp_like_local_ordering(
         return vec![];
     }
     let mut remaining = nodes.to_vec();
-    remaining.sort_by(|a, b| a.cost.partial_cmp(&b.cost).unwrap());
+    remaining.sort_by(|a, b| {
+        a.cost
+            .total_cmp(&b.cost)
+            .then_with(|| a.risk.total_cmp(&b.risk))
+            .then_with(|| a.id.cmp(&b.id))
+    });
     let mut out = vec![remaining.remove(0)];
     while !remaining.is_empty() {
         let last = out.last().unwrap();
@@ -25,7 +30,9 @@ pub fn tsp_like_local_ordering(
                     .get(&(last.family.clone(), b.family.clone()))
                     .copied()
                     .unwrap_or(b.cost);
-                ca.partial_cmp(&cb).unwrap()
+                ca.total_cmp(&cb)
+                    .then_with(|| a.cost.total_cmp(&b.cost))
+                    .then_with(|| a.id.cmp(&b.id))
             })
             .map(|(i, _)| i)
             .unwrap();

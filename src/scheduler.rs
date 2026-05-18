@@ -151,12 +151,21 @@ impl Scheduler {
     }
 
     fn order_nodes(&self, graph: &StrategyGraph, bayes: &BayesianState) -> Vec<StrategyNode> {
-        let mut nodes = graph.ordered_seed();
-        nodes.sort_by(|a, b| {
-            let sa = bayes.thompson_like_score(&a.id, a.prior, a.cost, a.risk);
-            let sb = bayes.thompson_like_score(&b.id, b.prior, b.cost, b.risk);
-            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+        let mut scored = graph
+            .ordered_seed()
+            .into_iter()
+            .map(|node| {
+                let score = bayes.thompson_like_score(&node.id, node.prior, node.cost, node.risk);
+                (node, score)
+            })
+            .collect::<Vec<_>>();
+        scored.sort_by(|(a, sa), (b, sb)| {
+            sb.total_cmp(&sa)
+                .then_with(|| a.cost.total_cmp(&b.cost))
+                .then_with(|| a.risk.total_cmp(&b.risk))
+                .then_with(|| a.id.cmp(&b.id))
         });
+        let nodes = scored.into_iter().map(|(node, _)| node).collect::<Vec<_>>();
         tsp_like_local_ordering(&nodes, &graph.transition_cost)
     }
 }

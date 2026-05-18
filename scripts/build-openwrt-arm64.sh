@@ -11,9 +11,70 @@ OPENWRT_CC="${OPENWRT_CC:-}"
 INSTALL_RUST_TARGET="${INSTALL_RUST_TARGET:-0}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DIST_DIR="${ROOT_DIR}/dist/openwrt-arm64"
 TMP_DIR="${ROOT_DIR}/tmp"
 SDK_EXTRACT_DIR="${TMP_DIR}/openwrt-sdk"
+DEBUG_BUILD=0
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/build-openwrt-arm64.sh [--debug] [--release] [--help]
+
+Options:
+  --debug    Build dev profile with debug symbols and do not strip the binary.
+             Output: dist/openwrt-arm64-debug/
+  --release  Build release profile and strip the binary.
+             Output: dist/openwrt-arm64/
+  --help     Show this help.
+
+Environment overrides:
+  OPENWRT_SDK=/path/to/openwrt-sdk
+  OPENWRT_CC=/path/to/aarch64-openwrt-linux-musl-gcc
+  OPENWRT_SDK_URL=https://...
+  TARGET=aarch64-unknown-linux-musl
+  PROFILE=release|dev
+  DIST_DIR=/custom/output/dir
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --debug)
+      PROFILE="dev"
+      DEBUG_BUILD=1
+      shift
+      ;;
+    --release)
+      PROFILE="release"
+      DEBUG_BUILD=0
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      printf 'error: unknown argument: %s\n\n' "$1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+if [[ "${PROFILE}" == "dev" || "${PROFILE}" == "debug" ]]; then
+  PROFILE="dev"
+  PROFILE_DIR="debug"
+  DEBUG_BUILD=1
+else
+  PROFILE_DIR="${PROFILE}"
+fi
+
+if [[ -z "${DIST_DIR:-}" ]]; then
+  if [[ "${DEBUG_BUILD}" == "1" ]]; then
+    DIST_DIR="${ROOT_DIR}/dist/openwrt-arm64-debug"
+  else
+    DIST_DIR="${ROOT_DIR}/dist/openwrt-arm64"
+  fi
+fi
 
 die() {
   printf 'error: %s\n' "$*" >&2
@@ -158,6 +219,7 @@ export "CXX_${TARGET//-/_}=${CC%-gcc}-g++"
 export "RANLIB_${TARGET//-/_}=$(tool_from_cc "${CC}" ranlib)"
 
 printf 'Building %s for %s\n' "${BIN_NAME}" "${TARGET}"
+printf '  profile: %s\n' "${PROFILE}"
 printf '  linker: %s\n' "${CC}"
 printf '  ar:     %s\n' "${AR}"
 
@@ -165,8 +227,12 @@ cd "${ROOT_DIR}"
 cargo build --locked --target "${TARGET}" --profile "${PROFILE}"
 
 mkdir -p "${DIST_DIR}/config"
-cp "target/${TARGET}/${PROFILE}/${BIN_NAME}" "${DIST_DIR}/${BIN_NAME}"
-"${STRIP}" "${DIST_DIR}/${BIN_NAME}" || true
+cp "target/${TARGET}/${PROFILE_DIR}/${BIN_NAME}" "${DIST_DIR}/${BIN_NAME}"
+if [[ "${DEBUG_BUILD}" == "1" ]]; then
+  printf 'Debug build: keeping symbols, not stripping %s\n' "${DIST_DIR}/${BIN_NAME}"
+else
+  "${STRIP}" "${DIST_DIR}/${BIN_NAME}" || true
+fi
 cp -R config/checker.toml config/standart config/custom "${DIST_DIR}/config/"
 
 printf '\nOpenWrt arm64 build is ready:\n'

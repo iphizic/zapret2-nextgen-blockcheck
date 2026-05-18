@@ -121,7 +121,7 @@ pub struct DebugConfig {
 pub struct StrategiesConfig {
     pub file: PathBuf,
     pub transition_matrix: PathBuf,
-    pub soft_fail_family_limit: usize,
+    pub soft_fail_family_limit: u32,
     #[serde(default = "default_successful_strategy_limit")]
     pub successful_strategy_limit: usize,
 
@@ -219,8 +219,11 @@ impl AppConfig {
                 "debug.keep_rules_on_failure conflicts with firewall.cleanup_on_exit safety"
             );
         }
-        if self.strategies.search_mode != "signal" {
-            anyhow::bail!("strategies.search_mode must be signal");
+        if !matches!(
+            self.strategies.search_mode.as_str(),
+            "signal" | "expand" | "force"
+        ) {
+            anyhow::bail!("strategies.search_mode must be signal, expand or force");
         }
         if self.strategies.max_candidates == 0 {
             anyhow::bail!("strategies.max_candidates must be greater than zero");

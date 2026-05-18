@@ -101,12 +101,16 @@ The checker stops after finding enough successful strategies by default:
 
 ```toml
 [strategies]
-successful_strategy_limit = 10
+search_mode = "signal"
+max_candidates = 200
+successful_strategy_limit = 20
 ```
 
 Use `--successful-strategy-limit` to override it for one run. With parallel workers,
 the final number of successes can be slightly higher than the limit if several
-in-flight probes succeed in the same batch.
+in-flight probes succeed in the same batch. `search_mode` can be `signal`,
+`expand`, or `force`; `max_candidates` caps generated concrete strategy variants
+after parameter expansion and de-duplication.
 
 On OpenWrt, make sure `nfqws2` exists and is executable. Either set it in
 `config/checker.toml`:
@@ -185,17 +189,30 @@ Or let the script download the default OpenWrt 24.10.4 mediatek/filogic SDK into
 ./scripts/build-openwrt-arm64.sh
 ```
 
+For a debug build with symbols kept in the binary:
+
+```bash
+./scripts/build-openwrt-arm64.sh --debug
+```
+
 To override the downloaded SDK URL:
 
 ```bash
 OPENWRT_SDK_URL=https://downloads.openwrt.org/.../openwrt-sdk-...tar.zst ./scripts/build-openwrt-arm64.sh
 ```
 
-Artifacts are written to `dist/openwrt-arm64/`:
+Release artifacts are written to `dist/openwrt-arm64/`:
 
 ```text
 dist/openwrt-arm64/zapret-checker
 dist/openwrt-arm64/config/
+```
+
+Debug artifacts are written to `dist/openwrt-arm64-debug/` and are not stripped:
+
+```text
+dist/openwrt-arm64-debug/zapret-checker
+dist/openwrt-arm64-debug/config/
 ```
 
 ## Status

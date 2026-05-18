@@ -60,6 +60,8 @@ file = "config/standart/strategies.yaml"
 transition_matrix = "config/standart/transition_matrix.yaml"
 soft_fail_family_limit = 2
 successful_strategy_limit = 20
+search_mode = "signal"
+max_candidates = 200
 
 [bayes]
 state_file = "config/standart/bayesian_priors.yaml"

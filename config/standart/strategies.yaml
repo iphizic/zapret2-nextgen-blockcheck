@@ -984,25 +984,34 @@ candidate_generators:
       - family: split
         actions: [multisplit_tls]
         params:
-          pos: [sniext+1, host+1, midsld]
+          pos: [1, 2, sniext+1, sniext+4, host+1, midsld, endhost-1]
       - family: disorder
-        actions: [multidisorder_tls]
+        actions: [multidisorder_tls, multidisorder_legacy_tls]
         params:
-          pos: [sniext+1, host+1, midsld]
+          pos: [1, 2, sniext+1, sniext+4, host+1, midsld, endhost-1]
       - family: fake
         actions: [fake_tls]
         params:
+          blob: [fake_default_tls]
           fooling: [badsum, autottl]
+          tls_mod: [none, random_sni, random_session_id]
       - family: faked_split
-        actions: [fakedsplit_tls]
+        actions: [fakedsplit_tls, fakeddisorder_tls]
         params:
-          pos: [midsld]
-          fooling: [badsum]
+          pos: [sniext+1, host+1, midsld, endhost-1]
+          fooling: [badsum, autottl]
+          pattern: [zero, random]
+      - family: seqovl
+        actions: [multisplit_seqovl_tls]
+        params:
+          pos: [sniext+1, host+1, midsld]
+          seqovl: [1, 2, 4, midsld-1]
+          seqovl_pattern: [zero, random]
       - family: wsize
-        actions: [wssize]
+        actions: [wsize, wssize]
         params:
-          wsize: [1, 2]
-          scale: [6]
+          wsize: [1, 2, 4, 8]
+          scale: [0, 1, 2, 4, 6]
     quic:
       - family: fake
         actions: [fake_quic]

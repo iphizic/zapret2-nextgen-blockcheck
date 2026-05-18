@@ -12,7 +12,6 @@ mod scoring;
 mod types;
 mod worker;
 
-use anyhow::Context;
 use bayes::BayesianState;
 use clap::{Parser, Subcommand};
 use config::AppConfig;
@@ -30,7 +29,7 @@ use types::*;
 use worker::WorkerRuntime;
 
 #[derive(Parser, Debug)]
-#[command(name = "zapret-checker")]
+#[command(name = "zapret-checker", version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -79,6 +78,9 @@ struct CheckOutput {
     baseline: ProbeResult,
     results: Vec<scheduler::StrategyRunResult>,
     successful_strategy_limit: usize,
+    search_mode: String,
+    max_candidates: usize,
+    generated_count: usize,
 }
 
 #[tokio::main]
@@ -210,6 +212,9 @@ async fn main() -> anyhow::Result<()> {
                         baseline,
                         results: Vec::new(),
                         successful_strategy_limit,
+                        search_mode: cfg.strategies.search_mode.clone(),
+                        max_candidates: cfg.strategies.max_candidates,
+                        generated_count: 0,
                     })?
                 );
                 return Ok(());
@@ -239,14 +244,14 @@ async fn main() -> anyhow::Result<()> {
             };
             let (strategies_file, transition_matrix_file) =
                 strategy_paths(&cfg, strategies_dir.as_deref());
-            let mut graph = StrategyGraph::load_for_protocol(
+            let graph = StrategyGraph::load_for_protocol_mode(
                 &strategies_file,
                 &transition_matrix_file,
                 protocol.catalog_key(),
+                &cfg.strategies.search_mode,
+                cfg.strategies.max_candidates,
             )?;
-            if graph.nodes.len() > cfg.strategies.max_candidates {
-                graph.nodes.truncate(cfg.strategies.max_candidates);
-            }
+            let generated_count = graph.nodes.len();
             let scheduler = scheduler::Scheduler {
                 runtime,
                 workers_count: workers
@@ -255,11 +260,7 @@ async fn main() -> anyhow::Result<()> {
                     .max(1),
                 successful_strategy_limit,
                 pruning_policy: PruningPolicy {
-                    soft_fail_family_limit: cfg
-                        .strategies
-                        .soft_fail_family_limit
-                        .try_into()
-                        .context("strategies.soft_fail_family_limit does not fit into u32")?,
+                    soft_fail_family_limit: cfg.strategies.soft_fail_family_limit,
                     combo_requires_signal: true,
                 },
                 score_weights: ScoreWeights::default(),
@@ -286,6 +287,9 @@ async fn main() -> anyhow::Result<()> {
                 baseline,
                 results,
                 successful_strategy_limit,
+                search_mode: cfg.strategies.search_mode.clone(),
+                max_candidates: cfg.strategies.max_candidates,
+                generated_count,
             };
             if json {
                 println!("{}", serde_json::to_string_pretty(&output)?);
@@ -537,9 +541,12 @@ fn print_check_report(output: &CheckOutput) {
     let failed = total.saturating_sub(success);
 
     println!("Summary");
+    println!("  generated: {}", output.generated_count);
     println!("  tested:   {}", total);
     println!("  success:  {}", success);
     println!("  failed:   {}", failed);
+    println!("  search_mode: {}", output.search_mode);
+    println!("  max_candidates: {}", output.max_candidates);
     println!(
         "  stop_at_success: {}",
         if output.successful_strategy_limit == 0 {
@@ -560,8 +567,10 @@ fn print_check_report(output: &CheckOutput) {
 
     successful.sort_by(|a, b| {
         b.adaptive_score
-            .partial_cmp(&a.adaptive_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .total_cmp(&a.adaptive_score)
+            .then_with(|| a.node.cost.total_cmp(&b.node.cost))
+            .then_with(|| a.node.risk.total_cmp(&b.node.risk))
+            .then_with(|| a.node.id.cmp(&b.node.id))
     });
 
     if successful.is_empty() {
