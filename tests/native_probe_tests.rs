@@ -20,6 +20,17 @@ fn timeouts() -> ProbeTimeouts {
     }
 }
 
+fn request(path: &str) -> HttpRequestSpec {
+    HttpRequestSpec {
+        method: HttpMethod::Get,
+        path_and_query: path.into(),
+        user_agent: "zapret-checker".into(),
+        read_mode: ReadMode::Body,
+        min_body_bytes: 1,
+        max_read_bytes: 1024,
+    }
+}
+
 #[tokio::test]
 async fn bind_zero_assigns_source_port_and_socket_holds_it_until_connect() {
     let listener = match TcpListener::bind("127.0.0.1:0").await {
@@ -93,6 +104,7 @@ async fn native_plain_http_probe_reads_status() {
         target_port: addr.port(),
         protocol: ProbeProtocol::HttpPlain,
         path: "/".into(),
+        request: request("/"),
         timeouts: timeouts(),
     };
     let ctx = ProbeContext {
@@ -157,6 +169,7 @@ async fn native_tls_http_probe_reads_status() {
         target_port: addr.port(),
         protocol: ProbeProtocol::Tls12Http11,
         path: "/".into(),
+        request: request("/"),
         timeouts: timeouts(),
     };
     let ctx = ProbeContext {
@@ -202,6 +215,7 @@ async fn native_plain_http_probe_first_byte_timeout() {
         target_port: addr.port(),
         protocol: ProbeProtocol::HttpPlain,
         path: "/".into(),
+        request: request("/"),
         timeouts: ProbeTimeouts {
             connect_ms: 500,
             tls_ms: 500,
@@ -242,6 +256,7 @@ async fn native_probe_honors_pre_cancelled_token() {
         target_port: 9,
         protocol: ProbeProtocol::HttpPlain,
         path: "/".into(),
+        request: request("/"),
         timeouts: timeouts(),
     };
     let ctx = ProbeContext {

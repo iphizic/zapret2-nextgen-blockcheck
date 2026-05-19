@@ -41,9 +41,20 @@ pub struct ProbeConfig {
     pub tls_timeout_ms: u64,
     pub first_byte_timeout_ms: u64,
     pub total_timeout_ms: u64,
+    #[serde(default = "default_max_read_bytes")]
     pub max_read_bytes: usize,
+    #[serde(default = "default_user_agent")]
     pub user_agent: String,
-    pub path: String,
+    #[serde(default = "default_http_method")]
+    pub method: String,
+    #[serde(default = "default_read_mode")]
+    pub read_mode: String,
+    #[serde(default = "default_min_body_bytes")]
+    pub min_body_bytes: usize,
+    #[serde(default)]
+    pub base_domains: Vec<String>,
+    #[serde(default = "default_test_count")]
+    pub test_count: usize,
 
     #[serde(default)]
     pub protocols: ProtocolProbeConfig,
@@ -69,6 +80,30 @@ pub struct ProtocolProbeConfig {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_user_agent() -> String {
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:150.0) Gecko/20100101 Firefox/150.0".to_string()
+}
+
+fn default_http_method() -> String {
+    "GET".to_string()
+}
+
+fn default_read_mode() -> String {
+    "body".to_string()
+}
+
+fn default_min_body_bytes() -> usize {
+    1
+}
+
+fn default_max_read_bytes() -> usize {
+    65536
+}
+
+fn default_test_count() -> usize {
+    1
 }
 
 fn default_preferred_protocol() -> String {
@@ -241,6 +276,16 @@ impl AppConfig {
         }
         if !matches!(self.probe.backend.as_str(), "native" | "curl") {
             anyhow::bail!("probe.backend must be native or curl");
+        }
+        crate::types::HttpMethod::parse_config(&self.probe.method)?;
+        crate::types::ReadMode::parse_config(&self.probe.read_mode)?;
+        if self.probe.min_body_bytes > self.probe.max_read_bytes {
+            anyhow::bail!(
+                "probe.min_body_bytes must be less than or equal to probe.max_read_bytes"
+            );
+        }
+        if self.probe.test_count == 0 {
+            anyhow::bail!("probe.test_count must be greater than zero");
         }
         if !matches!(self.firewall.backend.as_str(), "nftables" | "iptables") {
             anyhow::bail!("firewall.backend must be nftables or iptables");

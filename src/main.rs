@@ -40,7 +40,19 @@ enum Commands {
         #[arg(long)]
         config: PathBuf,
         #[arg(long)]
-        host: String,
+        host: Option<String>,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long, value_enum)]
+        method: Option<HttpMethod>,
+        #[arg(long, value_enum)]
+        read_mode: Option<ReadMode>,
+        #[arg(long)]
+        min_body_bytes: Option<usize>,
+        #[arg(long)]
+        max_read_bytes: Option<usize>,
+        #[arg(long, value_name = "N")]
+        test_count: Option<usize>,
         #[arg(long)]
         workers: Option<usize>,
         #[arg(long)]
@@ -74,6 +86,11 @@ enum Commands {
 
 #[derive(Debug, Serialize)]
 struct CheckOutput {
+    target: String,
+    target_scheme: TargetScheme,
+    request: HttpRequestSpec,
+    test_count: usize,
+    test_targets: Vec<String>,
     baseline: ProbeResult,
     results: Vec<scheduler::StrategyRunResult>,
     successful_strategy_limit: usize,
@@ -106,6 +123,7 @@ async fn main() -> anyhow::Result<()> {
             let cfg = AppConfig::load(&config)?;
             let protocol = ProbeProtocol::Tls12Http11;
             let ip = resolve_one(&host, 443)?;
+            let request = request_from_config(&cfg, None, None, None, None)?;
             let probe = NativeTcpTlsHttpProbe::new(
                 cfg.source_port.bind_ipv4,
                 cfg.source_port.bind_ipv6,
@@ -120,7 +138,8 @@ async fn main() -> anyhow::Result<()> {
                 target_ip: ip,
                 protocol: protocol,
                 target_port: protocol.default_port(),
-                path: cfg.probe.path,
+                path: request.path_and_query.clone(),
+                request,
                 timeouts: ProbeTimeouts {
                     connect_ms: cfg.probe.connect_timeout_ms,
                     tls_ms: cfg.probe.tls_timeout_ms,
@@ -139,6 +158,12 @@ async fn main() -> anyhow::Result<()> {
         Commands::Check {
             config,
             host,
+            url,
+            method,
+            read_mode,
+            min_body_bytes,
+            max_read_bytes,
+            test_count,
             workers,
             backend,
             strategies_dir,
@@ -151,9 +176,57 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let cfg = AppConfig::load(&config)?;
             let backend = backend.unwrap_or_else(|| cfg.probe.backend.clone());
-            let protocol = selected_protocol(&cfg, probe_protocol)?;
-            let port = protocol.default_port();
-            let ip = resolve_one(&host, port)?;
+            let explicit_protocol_from_cli = probe_protocol.is_some();
+            let selected_protocol = selected_protocol(&cfg, probe_protocol)?;
+            let cli_target_requested = host.is_some() || url.is_some();
+            let target = primary_target_request(
+                &cfg,
+                host,
+                url,
+                selected_protocol,
+                explicit_protocol_from_cli,
+            )?;
+            if !protocol_enabled(&cfg, target.protocol) {
+                anyhow::bail!(
+                    "selected protocol {:?} is disabled in config",
+                    target.protocol
+                );
+            }
+            let ip = resolve_one(&target.host, target.port)?;
+            let request =
+                request_from_config(&cfg, method, read_mode, min_body_bytes, max_read_bytes)?;
+            let request = HttpRequestSpec {
+                path_and_query: target.path_and_query.clone(),
+                ..request
+            };
+            let test_count = test_count.unwrap_or(cfg.probe.test_count);
+            if test_count == 0 {
+                anyhow::bail!("--test-count must be greater than zero");
+            }
+            let strategy_targets = if cli_target_requested {
+                let repeated_target = StrategyProbeTarget {
+                    original: target.original.clone(),
+                    host: target.host.clone(),
+                    ip,
+                    port: target.port,
+                    protocol: target.protocol,
+                    request: request.clone(),
+                };
+                let mut repeated = Vec::with_capacity(test_count);
+                for _ in 0..test_count {
+                    repeated.push(repeated_target.clone());
+                }
+                // CLI target is authoritative: configured base_domains are ignored.
+                repeated
+            } else {
+                build_strategy_targets(
+                    &cfg,
+                    &request,
+                    selected_protocol,
+                    explicit_protocol_from_cli,
+                    test_count,
+                )?
+            };
             if backend == "curl" {
                 if !cfg.debug.enable_curl_fallback {
                     anyhow::bail!(
@@ -170,11 +243,12 @@ async fn main() -> anyhow::Result<()> {
                     strategy_id: "curl-reference".into(),
                     worker_id: 0,
                     strategy_args: vec![],
-                    target_host: host,
+                    target_host: target.host,
                     target_ip: ip,
-                    protocol,
-                    target_port: protocol.default_port(),
-                    path: cfg.probe.path,
+                    protocol: target.protocol,
+                    target_port: target.port,
+                    path: request.path_and_query.clone(),
+                    request,
                     timeouts,
                 };
                 let ctx = ProbeContext {
@@ -202,22 +276,44 @@ async fn main() -> anyhow::Result<()> {
                 first_byte_ms: cfg.probe.first_byte_timeout_ms,
                 total_ms: cfg.probe.total_timeout_ms,
             };
+            if !json {
+                eprintln!(
+                    "live: target {} host={} ip={} port={} protocol={:?} method={} read_mode={:?}",
+                    target.original,
+                    target.host,
+                    ip,
+                    target.port,
+                    target.protocol,
+                    request.method.as_str(),
+                    request.read_mode,
+                );
+                eprintln!("live: baseline start");
+            }
             let baseline = run_baseline_probe(
                 &native_probe,
-                host.clone(),
+                target.host.clone(),
                 ip,
-                cfg.probe.path.clone(),
+                target.port,
+                request.clone(),
                 timeouts.clone(),
                 Some(cancellation.clone()),
-                protocol,
+                target.protocol,
             )
             .await;
+            if !json {
+                eprintln!("live: baseline {}", live_probe_summary(&baseline));
+            }
             let successful_strategy_limit =
                 successful_strategy_limit.unwrap_or(cfg.strategies.successful_strategy_limit);
             if should_skip_strategies_after_baseline(&baseline) {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&CheckOutput {
+                        target: target.original,
+                        target_scheme: target.scheme,
+                        request,
+                        test_count,
+                        test_targets: strategy_targets.iter().map(target_display_key).collect(),
                         baseline,
                         results: Vec::new(),
                         successful_strategy_limit,
@@ -259,7 +355,7 @@ async fn main() -> anyhow::Result<()> {
             let graph = StrategyGraph::load_for_protocol_mode(
                 &strategies_file,
                 &transition_matrix_file,
-                protocol.catalog_key(),
+                target.protocol.catalog_key(),
                 &cfg.strategies.search_mode,
                 cfg.strategies.max_candidates,
                 cfg.strategies.max_per_family,
@@ -267,6 +363,24 @@ async fn main() -> anyhow::Result<()> {
                 cfg.strategies.round_robin_families,
             )?;
             let generated_count = graph.nodes.len();
+            if !json {
+                eprintln!(
+                    "live: strategies start generated={} workers={} domains={} repeats={} total_tests={} stop_at_success={}",
+                    generated_count,
+                    workers
+                        .unwrap_or(cfg.workers.count)
+                        .min(cfg.queue.qnum_count as usize)
+                        .max(1),
+                    unique_strategy_targets(&strategy_targets),
+                    test_count,
+                    strategy_targets.len(),
+                    if successful_strategy_limit == 0 {
+                        "disabled".into()
+                    } else {
+                        successful_strategy_limit.to_string()
+                    },
+                );
+            }
             let scheduler = scheduler::Scheduler {
                 runtime,
                 workers_count: workers
@@ -279,26 +393,36 @@ async fn main() -> anyhow::Result<()> {
                     combo_requires_signal: true,
                 },
                 score_weights: ScoreWeights::default(),
-                protocol,
+                targets: strategy_targets.clone(),
+                live_log: !json,
             };
             let bayes_path = bayes_state.unwrap_or_else(|| cfg.bayes.state_file.clone());
             let mut bayes = BayesianState::load(&bayes_path)?;
             let results = scheduler
-                .run_graph_with_bayes(
-                    host,
-                    ip,
-                    graph,
-                    cfg.probe.path,
-                    timeouts,
-                    cancellation,
-                    &mut bayes,
-                )
+                .run_graph_with_bayes(graph, timeouts, cancellation, &mut bayes)
                 .await;
+            if !json {
+                let success = results
+                    .iter()
+                    .filter(|r| r.result.outcome == ProbeOutcome::Success)
+                    .count();
+                eprintln!(
+                    "live: strategies done tested={} success={} failed={}",
+                    results.len(),
+                    success,
+                    results.len().saturating_sub(success),
+                );
+            }
             bayes.save(&bayes_path)?;
             if cfg.firewall.cleanup_on_exit {
                 fw.cleanup_all().await?;
             }
             let output = &CheckOutput {
+                target: target.original,
+                target_scheme: target.scheme,
+                request,
+                test_count,
+                test_targets: strategy_targets.iter().map(target_display_key).collect(),
                 baseline,
                 results,
                 successful_strategy_limit,
@@ -323,7 +447,8 @@ async fn run_baseline_probe(
     probe: &NativeTcpTlsHttpProbe,
     host: String,
     ip: std::net::IpAddr,
-    path: String,
+    port: u16,
+    request: HttpRequestSpec,
     timeouts: ProbeTimeouts,
     cancellation: Option<CancellationToken>,
     protocol: ProbeProtocol,
@@ -334,9 +459,10 @@ async fn run_baseline_probe(
         strategy_args: vec![],
         target_host: host,
         target_ip: ip,
-        target_port: 443,
+        target_port: port,
         protocol,
-        path,
+        path: request.path_and_query.clone(),
+        request,
         timeouts,
     };
     let ctx = ProbeContext {
@@ -345,6 +471,119 @@ async fn run_baseline_probe(
         baseline: true,
     };
     ProbeBackend::probe(probe, task, ctx).await
+}
+
+fn request_from_config(
+    cfg: &AppConfig,
+    method: Option<HttpMethod>,
+    read_mode: Option<ReadMode>,
+    min_body_bytes: Option<usize>,
+    max_read_bytes: Option<usize>,
+) -> anyhow::Result<HttpRequestSpec> {
+    let request = HttpRequestSpec {
+        method: method.unwrap_or(HttpMethod::parse_config(&cfg.probe.method)?),
+        path_and_query: "/".into(),
+        user_agent: cfg.probe.user_agent.clone(),
+        read_mode: read_mode.unwrap_or(ReadMode::parse_config(&cfg.probe.read_mode)?),
+        min_body_bytes: min_body_bytes.unwrap_or(cfg.probe.min_body_bytes),
+        max_read_bytes: max_read_bytes.unwrap_or(cfg.probe.max_read_bytes),
+    };
+    if request.min_body_bytes > request.max_read_bytes {
+        anyhow::bail!("--min-body-bytes must be less than or equal to --max-read-bytes");
+    }
+    Ok(request)
+}
+
+fn primary_target_request(
+    cfg: &AppConfig,
+    host: Option<String>,
+    url: Option<String>,
+    selected_protocol: ProbeProtocol,
+    explicit_protocol_from_cli: bool,
+) -> anyhow::Result<TargetRequest> {
+    if host.is_none() && url.is_none() {
+        let Some(first) = cfg.probe.base_domains.first() else {
+            anyhow::bail!("specify --host/--url or configure probe.base_domains");
+        };
+        return parse_probe_domain_target(first, selected_protocol, explicit_protocol_from_cli);
+    }
+    parse_target_request(host, url, selected_protocol, explicit_protocol_from_cli)
+}
+
+fn build_strategy_targets(
+    cfg: &AppConfig,
+    primary_request: &HttpRequestSpec,
+    selected_protocol: ProbeProtocol,
+    explicit_protocol_from_cli: bool,
+    test_count: usize,
+) -> anyhow::Result<Vec<StrategyProbeTarget>> {
+    let mut targets = Vec::new();
+
+    if cfg.probe.base_domains.is_empty() {
+        anyhow::bail!("probe.base_domains must not be empty when --host/--url is omitted");
+    }
+
+    for domain in &cfg.probe.base_domains {
+        let parsed =
+            parse_probe_domain_target(domain, selected_protocol, explicit_protocol_from_cli)?;
+        append_repeated_strategy_target(cfg, &mut targets, parsed, primary_request, test_count)?;
+    }
+
+    Ok(targets)
+}
+
+fn append_repeated_strategy_target(
+    cfg: &AppConfig,
+    targets: &mut Vec<StrategyProbeTarget>,
+    parsed: TargetRequest,
+    primary_request: &HttpRequestSpec,
+    test_count: usize,
+) -> anyhow::Result<()> {
+    if !protocol_enabled(cfg, parsed.protocol) {
+        anyhow::bail!(
+            "base domain protocol {:?} is disabled in config for {}",
+            parsed.protocol,
+            parsed.original
+        );
+    }
+    let request = HttpRequestSpec {
+        path_and_query: parsed.path_and_query.clone(),
+        ..primary_request.clone()
+    };
+    let ip = resolve_one(&parsed.host, parsed.port)?;
+    for _ in 0..test_count {
+        targets.push(StrategyProbeTarget {
+            original: parsed.original.clone(),
+            host: parsed.host.clone(),
+            ip,
+            port: parsed.port,
+            protocol: parsed.protocol,
+            request: request.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn parse_probe_domain_target(
+    domain: &str,
+    selected_protocol: ProbeProtocol,
+    explicit_protocol_from_cli: bool,
+) -> anyhow::Result<TargetRequest> {
+    if domain.contains("://") {
+        parse_target_request(
+            None,
+            Some(domain.to_string()),
+            selected_protocol,
+            explicit_protocol_from_cli,
+        )
+    } else {
+        parse_target_request(
+            Some(domain.to_string()),
+            None,
+            selected_protocol,
+            explicit_protocol_from_cli,
+        )
+    }
 }
 
 fn should_skip_strategies_after_baseline(result: &ProbeResult) -> bool {
@@ -531,18 +770,75 @@ fn print_probe_result(prefix: &str, r: &ProbeResult) {
     );
 
     println!("{}bytes_read:    {}", prefix, r.bytes_read);
+    println!("{}header_bytes:  {}", prefix, r.header_bytes);
+    println!("{}body_bytes:    {}", prefix, r.body_bytes);
 }
 
 fn fmt_ms(v: Option<u64>) -> String {
     v.map(|x| x.to_string()).unwrap_or_else(|| "-".into())
 }
 
+fn live_probe_summary(r: &ProbeResult) -> String {
+    format!(
+        "outcome={:?} http={} body={}B bytes={} connect={}ms tls={}ms first_byte={}ms total={}ms failure={:?} error={:?}",
+        r.outcome,
+        r.http_status
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".into()),
+        r.body_bytes,
+        r.bytes_read,
+        fmt_ms(r.connect_ms),
+        fmt_ms(r.tls_ms),
+        fmt_ms(r.first_byte_ms),
+        r.total_ms,
+        r.failure_kind,
+        r.error_class,
+    )
+}
+
+fn unique_strategy_targets(targets: &[StrategyProbeTarget]) -> usize {
+    let mut seen = std::collections::BTreeSet::new();
+    for target in targets {
+        seen.insert((
+            target.host.clone(),
+            target.port,
+            target.request.path_and_query.clone(),
+        ));
+    }
+    seen.len()
+}
+
+fn target_display_key(target: &StrategyProbeTarget) -> String {
+    format!(
+        "{}:{}{}",
+        target.host, target.port, target.request.path_and_query
+    )
+}
+
+fn dedup_strings(items: &[String]) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for item in items {
+        if seen.insert(item.clone()) {
+            out.push(item.clone());
+        }
+    }
+    out
+}
+
 fn print_check_report(output: &CheckOutput) {
     println!("Target");
-    println!("  host:     {}", output.baseline.target_host);
-    println!("  ip:       {}", output.baseline.target_ip);
-    println!("  port:     {}", output.baseline.target_port);
-    println!("  protocol: {:?}", output.baseline.protocol);
+    println!("  url:        {}", output.target);
+    println!("  scheme:     {:?}", output.target_scheme);
+    println!("  host:       {}", output.baseline.target_host);
+    println!("  ip:         {}", output.baseline.target_ip);
+    println!("  port:       {}", output.baseline.target_port);
+    println!("  protocol:   {:?}", output.baseline.protocol);
+    println!("  method:     {}", output.request.method.as_str());
+    println!("  path:       {}", output.baseline.path);
+    println!("  read_mode:  {:?}", output.baseline.read_mode);
+    println!("  user-agent: {}", output.request.user_agent);
+    println!("  tests:      {}", output.test_count);
     println!();
 
     println!("Baseline");
@@ -568,6 +864,10 @@ fn print_check_report(output: &CheckOutput) {
     println!("  max_per_family: {}", output.max_per_family);
     println!("  max_per_action: {}", output.max_per_action);
     println!("  round_robin: {}", output.round_robin_families);
+    println!(
+        "  test_targets: {}",
+        dedup_strings(&output.test_targets).join(", ")
+    );
     println!(
         "  stop_at_success: {}",
         if output.successful_strategy_limit == 0 {
@@ -623,7 +923,7 @@ fn print_check_report(output: &CheckOutput) {
     } else {
         for item in successful {
             println!(
-                "  [{:>6.1}] {:<36} {:<12} http={} tls={}ms total={}ms",
+                "  [{:>6.1}] {:<36} {:<12} http={} body={}B tls={}ms total={}ms",
                 item.adaptive_score,
                 item.node.id,
                 item.node.family,
@@ -631,6 +931,7 @@ fn print_check_report(output: &CheckOutput) {
                     .http_status
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "-".into()),
+                item.result.body_bytes,
                 item.result
                     .tls_ms
                     .map(|v| v.to_string())

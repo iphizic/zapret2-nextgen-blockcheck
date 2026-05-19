@@ -14,11 +14,11 @@ fn config_loads_checker_toml_and_validates_os_assigned_source_port() {
     assert!(!cfg.probe.protocols.tls13);
     assert!(cfg.probe.protocols.quic);
     assert_eq!(cfg.probe.protocols.preferred, "tls12");
-    assert_eq!(cfg.strategies.successful_strategy_limit, 40);
+    assert_eq!(cfg.strategies.successful_strategy_limit, 80);
     assert_eq!(cfg.strategies.search_mode, "expand");
-    assert_eq!(cfg.strategies.max_candidates, 300);
-    assert_eq!(cfg.strategies.max_per_family, 24);
-    assert_eq!(cfg.strategies.max_per_action, 8);
+    assert_eq!(cfg.strategies.max_candidates, 1000);
+    assert_eq!(cfg.strategies.max_per_family, 64);
+    assert_eq!(cfg.strategies.max_per_action, 20);
     assert!(cfg.strategies.round_robin_families);
 }
 
@@ -26,7 +26,7 @@ fn config_loads_checker_toml_and_validates_os_assigned_source_port() {
 fn config_accepts_expand_search_mode() {
     let mut text = fs::read_to_string("config/checker.toml").unwrap();
     text = text.replace("search_mode = \"expand\"", "search_mode = \"force\"");
-    text = text.replace("max_candidates = 300", "max_candidates = 25");
+    text = text.replace("max_candidates = 1000", "max_candidates = 25");
     let path = std::env::temp_dir().join("zapret_checker_expand_mode.toml");
     fs::write(&path, text).unwrap();
     let cfg = AppConfig::load(&path).unwrap();
@@ -103,10 +103,134 @@ fn signal_cartesian_product_expands_split_positions() {
         .nodes
         .iter()
         .filter(|n| {
-            n.family == "split" && n.args[0].contains("multisplit:payload=tls_client_hello")
+            n.family == "split"
+                && n.args
+                    .iter()
+                    .any(|arg| arg.contains("multisplit:payload=tls_client_hello"))
         })
         .count();
     assert!(split_count >= 7, "got {split_count}");
+}
+
+#[test]
+fn catalog_strategy_adds_payload_filter_before_lua_desync() {
+    let graph = StrategyGraph::load_for_protocol_mode(
+        &PathBuf::from("config/standart/strategies.yaml"),
+        &PathBuf::from("config/standart/transition_matrix.yaml"),
+        "tls12",
+        "signal",
+        200,
+        24,
+        8,
+        true,
+    )
+    .unwrap();
+    let node = graph
+        .nodes
+        .iter()
+        .find(|n| {
+            n.args
+                .iter()
+                .any(|arg| arg.contains("multisplit:payload=tls_client_hello"))
+        })
+        .unwrap();
+    assert_eq!(node.args[0], "--payload=tls_client_hello");
+    assert!(node.args[1].starts_with("--lua-desync="));
+}
+
+#[test]
+fn catalog_strategy_infers_payload_option_when_lua_function_uses_standard_payload() {
+    let graph = StrategyGraph::load_for_protocol_mode(
+        &PathBuf::from("config/standart/strategies.yaml"),
+        &PathBuf::from("config/standart/transition_matrix.yaml"),
+        "tls12",
+        "signal",
+        400,
+        24,
+        8,
+        true,
+    )
+    .unwrap();
+    let node = graph
+        .nodes
+        .iter()
+        .find(|n| n.args.iter().any(|arg| arg.contains("tcpseg:pos=")))
+        .unwrap();
+    assert_eq!(node.args[0], "--payload=tls_client_hello");
+    assert!(node.args[1].starts_with("--lua-desync=tcpseg:"));
+}
+
+#[test]
+fn fake_dir_blob_generates_separate_blob_option() {
+    let base =
+        std::env::temp_dir().join(format!("zapret_checker_fake_blobs_{}", std::process::id()));
+    let fake_dir = base.join("fake");
+    fs::create_dir_all(&fake_dir).unwrap();
+    let fake_file = fake_dir.join("tls_fake.bin");
+    fs::write(&fake_file, [0x16, 0x03, 0x01]).unwrap();
+
+    let strategies_path = base.join("strategies.yaml");
+    let transition_path = base.join("transition.yaml");
+    fs::write(
+        &strategies_path,
+        format!(
+            r#"
+families:
+  - id: fake
+    enabled: true
+    protocols: [tls12]
+    cost: 1
+    risk: 1
+    prior: [2, 2]
+    actions:
+      - id: tls_blob_file
+        protocols: [tls12]
+        params:
+          blob:
+            values: ["fake_dir_tls:{}"]
+        render:
+          lua_desync: "fake:payload=tls_client_hello:blob={{{{blob}}}}"
+candidate_generators:
+  signal:
+    tls12:
+      - family: fake
+        actions: [tls_blob_file]
+"#,
+            fake_dir.display()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &transition_path,
+        r#"
+costs:
+  fake:
+    fake: 0
+"#,
+    )
+    .unwrap();
+
+    let graph = StrategyGraph::load_for_protocol_mode(
+        &strategies_path,
+        &transition_path,
+        "tls12",
+        "signal",
+        20,
+        24,
+        8,
+        true,
+    )
+    .unwrap();
+    let node = graph.nodes.first().unwrap();
+    assert_eq!(
+        node.args[0],
+        format!("--blob=fake_tls_tls_fake_bin:@{}", fake_file.display())
+    );
+    assert_eq!(node.args[1], "--payload=tls_client_hello");
+    assert_eq!(
+        node.args[2],
+        "--lua-desync=fake:payload=tls_client_hello:blob=fake_tls_tls_fake_bin"
+    );
 }
 
 #[test]
@@ -168,7 +292,10 @@ costs:
     )
     .unwrap();
     assert_eq!(graph.nodes.len(), 3);
-    assert!(graph.nodes.iter().all(|n| !n.args[0].contains("{{")));
+    assert!(graph
+        .nodes
+        .iter()
+        .all(|n| n.args.iter().all(|arg| !arg.contains("{{"))));
 }
 
 fn node(family: &str, action_id: &str, idx: usize) -> StrategyNode {

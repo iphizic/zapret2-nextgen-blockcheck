@@ -53,8 +53,6 @@ pub enum TlsProbeVersion {
 pub struct NativeTcpTlsHttpProbe {
     pub bind_ipv4: IpAddr,
     pub bind_ipv6: IpAddr,
-    pub max_read_bytes: usize,
-    pub user_agent: String,
 
     tls12_config: Arc<ClientConfig>,
     tls13_config: Arc<ClientConfig>,
@@ -65,8 +63,8 @@ impl NativeTcpTlsHttpProbe {
     pub fn new(
         bind_ipv4: IpAddr,
         bind_ipv6: IpAddr,
-        max_read_bytes: usize,
-        user_agent: String,
+        _max_read_bytes: usize,
+        _user_agent: String,
     ) -> Self {
         install_rustls_provider();
         let (tls12_config, tls12_error) = build_tls_config(Vec::new(), TlsProbeVersion::Tls12);
@@ -76,8 +74,6 @@ impl NativeTcpTlsHttpProbe {
         Self {
             bind_ipv4,
             bind_ipv6,
-            max_read_bytes,
-            user_agent,
             tls12_config: Arc::new(tls12_config),
             tls13_config: Arc::new(tls13_config),
             tls_config_error: tls12_error.or(tls13_error).map(Arc::new),
@@ -398,6 +394,9 @@ impl NativeTcpTlsHttpProbe {
             target_ip: task.target_ip,
             target_port: task.target_port,
             protocol: task.protocol,
+            path: task.request.path_and_query,
+            method: task.request.method,
+            read_mode: task.request.read_mode,
             setup_ms: None,
             connect_ms,
             tls_ms: connect_ms,
@@ -406,6 +405,8 @@ impl NativeTcpTlsHttpProbe {
             outcome: ProbeOutcome::Success,
             http_status: None,
             bytes_read: 0,
+            header_bytes: 0,
+            body_bytes: 0,
             failure_kind: None,
             error_class: None,
             error_message: None,
@@ -550,15 +551,7 @@ impl NativeTcpTlsHttpProbe {
         S: AsyncRead + AsyncWrite + Unpin,
     {
         let kind = probe_failure_kind(ctx.baseline);
-        let path = if task.path.is_empty() {
-            "/"
-        } else {
-            &task.path
-        };
-        let req = format!(
-            "GET {path} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\nConnection: close\r\n\r\n",
-            task.target_host, self.user_agent
-        );
+        let req = build_http_request(&task);
         if let Err(e) = stream.write_all(req.as_bytes()).await {
             return failure(
                 &task,
@@ -575,11 +568,13 @@ impl NativeTcpTlsHttpProbe {
             );
         }
         let first_byte_start = Instant::now();
-        let mut buf = vec![0u8; self.max_read_bytes.max(1)];
+        let max_read_bytes = task.request.max_read_bytes.max(1);
+        let mut buf = Vec::with_capacity(max_read_bytes);
+        let mut chunk = [0u8; 4096];
         let n = match cancellable_timeout(
             Duration::from_millis(task.timeouts.first_byte_ms),
             ctx.cancellation.as_ref(),
-            stream.read(&mut buf),
+            stream.read(&mut chunk),
         )
         .await
         {
@@ -639,10 +634,135 @@ impl NativeTcpTlsHttpProbe {
             }
         };
         let first_byte_ms = Some(first_byte_start.elapsed().as_millis() as u64);
-        let status = parse_http_status(&buf[..n]).ok();
-        let outcome = probe_outcome_for_http_status(status);
-        let (failure_kind, error_class, error_message) =
-            classify_probe_outcome(outcome, ctx.baseline);
+        buf.extend_from_slice(&chunk[..n.min(max_read_bytes)]);
+        let mut read = parse_http_response_read(&buf, first_byte_ms);
+
+        while !http_read_criteria_met(
+            &read,
+            task.request.method,
+            task.request.read_mode,
+            task.request.min_body_bytes,
+        ) && buf.len() < max_read_bytes
+        {
+            if let Some(token) = &ctx.cancellation {
+                if token.is_cancelled() {
+                    return cancelled_result(
+                        &task,
+                        ctx.qnum,
+                        source_port,
+                        total_start.elapsed().as_millis() as u64,
+                    );
+                }
+            }
+            let elapsed_ms = total_start.elapsed().as_millis() as u64;
+            if elapsed_ms >= task.timeouts.total_ms {
+                if http_timeout_can_succeed(
+                    &read,
+                    task.request.method,
+                    task.request.read_mode,
+                    task.request.min_body_bytes,
+                ) {
+                    break;
+                }
+                return failure(
+                    &task,
+                    ctx.qnum,
+                    source_port,
+                    ProbeOutcome::Timeout,
+                    kind,
+                    ProbeErrorClass::ReadTimeout,
+                    "read timeout",
+                    total_start,
+                    connect_ms,
+                    tls_ms,
+                    first_byte_ms,
+                );
+            }
+            let remaining = max_read_bytes - buf.len();
+            let read_len = remaining.min(chunk.len());
+            let read_timeout_ms = (task.timeouts.total_ms - elapsed_ms).max(1);
+            match cancellable_timeout(
+                Duration::from_millis(read_timeout_ms),
+                ctx.cancellation.as_ref(),
+                stream.read(&mut chunk[..read_len]),
+            )
+            .await
+            {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    read = parse_http_response_read(&buf, first_byte_ms);
+                }
+                Ok(Err(e)) => {
+                    if http_read_criteria_met(
+                        &read,
+                        task.request.method,
+                        task.request.read_mode,
+                        task.request.min_body_bytes,
+                    ) {
+                        break;
+                    }
+                    return failure(
+                        &task,
+                        ctx.qnum,
+                        source_port,
+                        ProbeOutcome::TcpReset,
+                        kind,
+                        ProbeErrorClass::ReadFailed,
+                        e.to_string(),
+                        total_start,
+                        connect_ms,
+                        tls_ms,
+                        first_byte_ms,
+                    );
+                }
+                Err(ProbeWaitError::Timeout) => {
+                    if http_timeout_can_succeed(
+                        &read,
+                        task.request.method,
+                        task.request.read_mode,
+                        task.request.min_body_bytes,
+                    ) {
+                        break;
+                    }
+                    return failure(
+                        &task,
+                        ctx.qnum,
+                        source_port,
+                        ProbeOutcome::Timeout,
+                        kind,
+                        ProbeErrorClass::ReadTimeout,
+                        "read timeout",
+                        total_start,
+                        connect_ms,
+                        tls_ms,
+                        first_byte_ms,
+                    );
+                }
+                Err(ProbeWaitError::Cancelled) => {
+                    return cancelled_result(
+                        &task,
+                        ctx.qnum,
+                        source_port,
+                        total_start.elapsed().as_millis() as u64,
+                    )
+                }
+            }
+        }
+
+        let (outcome, error_class, error_message) = classify_http_response(
+            read.status,
+            read.headers_complete,
+            read.body_bytes,
+            task.request.method,
+            task.request.read_mode,
+            task.request.min_body_bytes,
+        );
+        let failure_kind = if outcome == ProbeOutcome::Success {
+            None
+        } else {
+            Some(probe_failure_kind(ctx.baseline))
+        };
 
         ProbeResult {
             strategy_id: task.strategy_id,
@@ -653,18 +773,60 @@ impl NativeTcpTlsHttpProbe {
             target_ip: task.target_ip,
             target_port: task.target_port,
             protocol: task.protocol,
+            path: task.request.path_and_query,
+            method: task.request.method,
+            read_mode: task.request.read_mode,
             setup_ms: None,
             connect_ms,
             tls_ms,
             first_byte_ms,
             total_ms: total_start.elapsed().as_millis() as u64,
             outcome,
-            http_status: status,
-            bytes_read: n,
+            http_status: read.status,
+            bytes_read: read.total_bytes,
+            header_bytes: read.header_bytes,
+            body_bytes: read.body_bytes,
             failure_kind,
             error_class,
             error_message,
         }
+    }
+}
+
+fn http_timeout_can_succeed(
+    read: &HttpResponseRead,
+    method: HttpMethod,
+    read_mode: ReadMode,
+    min_body_bytes: usize,
+) -> bool {
+    if http_read_criteria_met(read, method, read_mode, min_body_bytes) {
+        return true;
+    }
+    read_mode == ReadMode::Full
+        && read.headers_complete
+        && status_is_success(read.status)
+        && read.body_bytes >= min_body_bytes
+}
+
+pub fn build_http_request(task: &ProbeTask) -> String {
+    let path = if task.request.path_and_query.is_empty() {
+        "/"
+    } else {
+        &task.request.path_and_query
+    };
+    format!(
+        "{} {path} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+        task.request.method.as_str(),
+        host_header(&task.target_host, task.target_port, task.protocol),
+        task.request.user_agent,
+    )
+}
+
+fn host_header(host: &str, port: u16, protocol: ProbeProtocol) -> String {
+    if port == protocol.default_port() {
+        host.to_string()
+    } else {
+        format!("{host}:{port}")
     }
 }
 
@@ -749,6 +911,9 @@ impl ProbeBackend for NativeTcpTlsHttpProbe {
                     target_ip: task.target_ip,
                     target_port: task.target_port,
                     protocol: task.protocol,
+                    path: task.request.path_and_query.clone(),
+                    method: task.request.method,
+                    read_mode: task.request.read_mode,
                     setup_ms: None,
                     connect_ms: None,
                     tls_ms: None,
@@ -757,6 +922,8 @@ impl ProbeBackend for NativeTcpTlsHttpProbe {
                     outcome: ProbeOutcome::Timeout,
                     http_status: None,
                     bytes_read: 0,
+                    header_bytes: 0,
+                    body_bytes: 0,
                     failure_kind: Some(probe_failure_kind(ctx.baseline)),
                     error_class: Some(ProbeErrorClass::ReadTimeout),
                     error_message: Some("total timeout".into()),
@@ -770,6 +937,9 @@ impl ProbeBackend for NativeTcpTlsHttpProbe {
                     target_ip: task.target_ip,
                     target_port: task.target_port,
                     protocol: task.protocol,
+                    path: task.request.path_and_query.clone(),
+                    method: task.request.method,
+                    read_mode: task.request.read_mode,
                     setup_ms: None,
                     connect_ms: None,
                     tls_ms: None,
@@ -778,6 +948,8 @@ impl ProbeBackend for NativeTcpTlsHttpProbe {
                     outcome: ProbeOutcome::Cancelled,
                     http_status: None,
                     bytes_read: 0,
+                    header_bytes: 0,
+                    body_bytes: 0,
                     failure_kind: Some(FailureKind::Cancelled),
                     error_class: Some(ProbeErrorClass::Cancelled),
                     error_message: Some("cancelled".into()),
@@ -811,10 +983,10 @@ impl ProbeBackend for CurlProbeFallback {
             ProbeProtocol::Tls13Http11 => "https",
             ProbeProtocol::QuicHttp3Future => "https",
         };
-        let path = if task.path.is_empty() {
+        let path = if task.request.path_and_query.is_empty() {
             "/"
         } else {
-            &task.path
+            &task.request.path_and_query
         };
         let url = format!(
             "{scheme}://{}:{port}{path}",
@@ -837,11 +1009,15 @@ impl ProbeBackend for CurlProbeFallback {
             .arg("--max-time")
             .arg(format!("{:.3}", task.timeouts.total_ms as f64 / 1000.0))
             .arg("--user-agent")
-            .arg("zapret-checker")
+            .arg(task.request.user_agent.clone())
             .arg("--output")
-            .arg("-")
+            .arg("/dev/null")
             .arg("--write-out")
-            .arg("\n%{http_code}");
+            .arg("%{http_code} %{size_header} %{size_download}");
+
+        if task.request.method == HttpMethod::Head {
+            cmd.arg("--head");
+        }
 
         match task.protocol {
             ProbeProtocol::Tls12Http11 => {
@@ -887,11 +1063,45 @@ impl ProbeBackend for CurlProbeFallback {
             }
         };
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let status = stdout
-            .lines()
-            .last()
+        let mut parts = stdout.split_whitespace();
+        let status = parts
+            .next()
             .and_then(|line| line.parse::<u16>().ok())
             .filter(|s| *s != 0);
+        let header_bytes = parts
+            .next()
+            .and_then(|line| line.parse::<f64>().ok())
+            .map(|v| v as usize)
+            .unwrap_or(0);
+        let body_bytes = parts
+            .next()
+            .and_then(|line| line.parse::<f64>().ok())
+            .map(|v| v as usize)
+            .unwrap_or(0);
+        let headers_complete = output.status.success() && status.is_some();
+        let (outcome, error_class, error_message) = if output.status.success() {
+            classify_http_response(
+                status,
+                headers_complete,
+                body_bytes,
+                task.request.method,
+                task.request.read_mode,
+                task.request.min_body_bytes,
+            )
+        } else {
+            (
+                ProbeOutcome::InternalError,
+                Some(ProbeErrorClass::CurlFailed),
+                Some(String::from_utf8_lossy(&output.stderr).to_string()),
+            )
+        };
+        let failure_kind = if outcome == ProbeOutcome::Success {
+            None
+        } else if output.status.success() {
+            Some(probe_failure_kind(ctx.baseline))
+        } else {
+            Some(FailureKind::InfrastructureFailure)
+        };
         ProbeResult {
             strategy_id: task.strategy_id,
             worker_id: task.worker_id,
@@ -901,33 +1111,22 @@ impl ProbeBackend for CurlProbeFallback {
             target_ip: task.target_ip,
             target_port: task.target_port,
             protocol: task.protocol,
+            path: task.request.path_and_query,
+            method: task.request.method,
+            read_mode: task.request.read_mode,
             setup_ms: None,
             connect_ms: None,
             tls_ms: None,
             first_byte_ms: None,
             total_ms: start.elapsed().as_millis() as u64,
-            outcome: if output.status.success() {
-                probe_outcome_for_http_status(status)
-            } else {
-                ProbeOutcome::InternalError
-            },
+            outcome,
             http_status: status,
-            bytes_read: output.stdout.len(),
-            failure_kind: if output.status.success() {
-                None
-            } else {
-                Some(probe_failure_kind(ctx.baseline))
-            },
-            error_class: if output.status.success() {
-                None
-            } else {
-                Some(ProbeErrorClass::CurlFailed)
-            },
-            error_message: if output.status.success() {
-                None
-            } else {
-                Some(String::from_utf8_lossy(&output.stderr).to_string())
-            },
+            bytes_read: header_bytes + body_bytes,
+            header_bytes,
+            body_bytes,
+            failure_kind,
+            error_class,
+            error_message,
         }
     }
 }
@@ -948,6 +1147,40 @@ pub fn parse_http_status(bytes: &[u8]) -> Result<u16, ProbeErrorClass> {
         .ok_or(ProbeErrorClass::InvalidHttpResponse)?
         .parse::<u16>()
         .map_err(|_| ProbeErrorClass::InvalidHttpResponse)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HttpResponseRead {
+    pub status: Option<u16>,
+    pub header_bytes: usize,
+    pub body_bytes: usize,
+    pub total_bytes: usize,
+    pub first_byte_ms: Option<u64>,
+    pub headers_complete: bool,
+}
+
+pub fn parse_http_response_read(bytes: &[u8], first_byte_ms: Option<u64>) -> HttpResponseRead {
+    let headers_end = bytes.windows(4).position(|w| w == b"\r\n\r\n");
+    let headers_complete = headers_end.is_some();
+    let header_bytes = headers_end.map(|idx| idx + 4).unwrap_or(0);
+    let body_bytes = if headers_complete {
+        bytes.len().saturating_sub(header_bytes)
+    } else {
+        0
+    };
+    let status = if headers_complete {
+        parse_http_status(&bytes[..header_bytes]).ok()
+    } else {
+        None
+    };
+    HttpResponseRead {
+        status,
+        header_bytes,
+        body_bytes,
+        total_bytes: bytes.len(),
+        first_byte_ms,
+        headers_complete,
+    }
 }
 
 fn cancelled_result(task: &ProbeTask, qnum: u16, source_port: u16, total_ms: u64) -> ProbeResult {
@@ -1000,6 +1233,7 @@ fn probe_failure_kind(baseline: bool) -> FailureKind {
     }
 }
 
+#[allow(dead_code)]
 pub fn probe_outcome_for_http_status(status: Option<u16>) -> ProbeOutcome {
     match status {
         Some(200..=399) => ProbeOutcome::Success,
@@ -1009,72 +1243,77 @@ pub fn probe_outcome_for_http_status(status: Option<u16>) -> ProbeOutcome {
     }
 }
 
-fn classify_probe_outcome(
-    outcome: ProbeOutcome,
-    baseline: bool,
-) -> (Option<FailureKind>, Option<ProbeErrorClass>, Option<String>) {
-    match outcome {
-        ProbeOutcome::Success => (None, None, None),
+fn status_is_success(status: Option<u16>) -> bool {
+    matches!(status, Some(200..=399))
+}
 
-        ProbeOutcome::Cancelled => (
-            Some(FailureKind::Cancelled),
-            Some(ProbeErrorClass::Cancelled),
-            Some("cancelled".into()),
-        ),
-
-        ProbeOutcome::HttpBlockPage => (
-            Some(probe_failure_kind(baseline)),
+pub fn classify_http_response(
+    status: Option<u16>,
+    headers_complete: bool,
+    body_bytes: usize,
+    method: HttpMethod,
+    read_mode: ReadMode,
+    min_body_bytes: usize,
+) -> (ProbeOutcome, Option<ProbeErrorClass>, Option<String>) {
+    if !headers_complete {
+        return (
+            ProbeOutcome::EmptyResponse,
+            Some(ProbeErrorClass::InvalidHttpResponse),
+            Some("HTTP response headers incomplete".into()),
+        );
+    }
+    if status.is_none() {
+        return (
+            ProbeOutcome::EmptyResponse,
+            Some(ProbeErrorClass::InvalidHttpResponse),
+            Some("invalid HTTP response status".into()),
+        );
+    }
+    if status_is_success(status) {
+        if method == HttpMethod::Head || read_mode == ReadMode::Headers {
+            return (ProbeOutcome::Success, None, None);
+        }
+        if body_bytes >= min_body_bytes {
+            return (ProbeOutcome::Success, None, None);
+        }
+        return (
+            ProbeOutcome::BodyTooSmall,
+            Some(ProbeErrorClass::BodyTooSmall),
+            Some(format!(
+                "HTTP body too small: got {body_bytes} bytes, need {min_body_bytes}"
+            )),
+        );
+    }
+    match status {
+        Some(403 | 451 | 400..=599) => (
+            ProbeOutcome::HttpBlockPage,
             Some(ProbeErrorClass::InvalidHttpResponse),
             Some("HTTP block page/status".into()),
         ),
-
-        ProbeOutcome::EmptyResponse => (
-            Some(probe_failure_kind(baseline)),
-            Some(ProbeErrorClass::ReadFailed),
-            Some("empty response".into()),
+        _ => (
+            ProbeOutcome::EmptyResponse,
+            Some(ProbeErrorClass::InvalidHttpResponse),
+            Some("unexpected HTTP status".into()),
         ),
+    }
+}
 
-        ProbeOutcome::Timeout => (
-            Some(probe_failure_kind(baseline)),
-            Some(ProbeErrorClass::ReadTimeout),
-            Some("timeout".into()),
-        ),
-
-        ProbeOutcome::TcpReset => (
-            Some(probe_failure_kind(baseline)),
-            Some(ProbeErrorClass::ReadFailed),
-            Some("TCP reset".into()),
-        ),
-
-        ProbeOutcome::TlsAlert => (
-            Some(probe_failure_kind(baseline)),
-            Some(ProbeErrorClass::TlsFailed),
-            Some("TLS alert".into()),
-        ),
-
-        ProbeOutcome::Refused => (
-            Some(probe_failure_kind(baseline)),
-            Some(ProbeErrorClass::ConnectFailed),
-            Some("connection refused".into()),
-        ),
-
-        ProbeOutcome::NetworkUnreachable => (
-            Some(probe_failure_kind(baseline)),
-            Some(ProbeErrorClass::ConnectFailed),
-            Some("network unreachable".into()),
-        ),
-
-        ProbeOutcome::DnsFailure => (
-            Some(probe_failure_kind(baseline)),
-            Some(ProbeErrorClass::ConnectFailed),
-            Some("DNS failure".into()),
-        ),
-
-        ProbeOutcome::InternalError => (
-            Some(FailureKind::InfrastructureFailure),
-            Some(ProbeErrorClass::InternalError),
-            Some("internal error".into()),
-        ),
+fn http_read_criteria_met(
+    read: &HttpResponseRead,
+    method: HttpMethod,
+    read_mode: ReadMode,
+    min_body_bytes: usize,
+) -> bool {
+    if !read.headers_complete {
+        return false;
+    }
+    if method == HttpMethod::Head || read_mode == ReadMode::Headers {
+        return true;
+    }
+    match read_mode {
+        ReadMode::Headers => true,
+        ReadMode::Body => read.body_bytes >= min_body_bytes,
+        ReadMode::Full => false,
     }
 }
 
@@ -1100,6 +1339,9 @@ fn failure(
         target_ip: task.target_ip,
         target_port: task.target_port,
         protocol: task.protocol,
+        path: task.request.path_and_query.clone(),
+        method: task.request.method,
+        read_mode: task.request.read_mode,
         setup_ms: None,
         connect_ms,
         tls_ms,
@@ -1108,6 +1350,8 @@ fn failure(
         outcome,
         http_status: None,
         bytes_read: 0,
+        header_bytes: 0,
+        body_bytes: 0,
         failure_kind: Some(kind),
         error_class: Some(cls),
         error_message: Some(msg.into()),

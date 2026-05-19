@@ -35,6 +35,7 @@ pub fn adaptive_score(result: &ProbeResult, cost: f64, risk: f64, w: ScoreWeight
         | ProbeOutcome::TcpReset
         | ProbeOutcome::HttpBlockPage
         | ProbeOutcome::EmptyResponse
+        | ProbeOutcome::BodyTooSmall
         | ProbeOutcome::Refused => -w.timeout_penalty,
 
         ProbeOutcome::Cancelled => 0.0,

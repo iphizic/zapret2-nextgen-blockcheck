@@ -18,6 +18,7 @@ constants:
     aggressive: [none, badsum, autottl, badsum_autottl, md5sig, md5sig_autottl, timestamp, badseq, badack]
   wsize: [1, 2, 4, 8, 16]
   wscale: [0, 1, 2, 4, 6]
+  hostfake_templates: [random, random.$1D, random.$2D, random.$3D]
 
 bayes_defaults:
   alpha_beta_prior: [2, 2]
@@ -150,16 +151,6 @@ families:
             default: none
         render:
           lua_desync: "multidisorder:payload=tls_client_hello:pos={{pos}}{{fooling_suffix}}"
-      - id: multidisorder_legacy_tls
-        function: multidisorder_legacy
-        protocols: [tls12, tls13]
-        params:
-          pos:
-            values: [1, 2, sniext+1, sniext+4, host+1, midsld, endhost-1]
-            default: sniext+1
-        render:
-          lua_desync: "multidisorder_legacy:payload=tls_client_hello:pos={{pos}}"
-
   - id: fake
     enabled: true
     category: direct_fake_packet
@@ -173,7 +164,7 @@ families:
         protocols: [http]
         params:
           blob:
-            values: [fake_default_http]
+            values: [fake_default_http, fake_dir_http]
             default: fake_default_http
           fooling:
             values: [none, badsum, autottl, badsum_autottl]
@@ -185,7 +176,7 @@ families:
         protocols: [tls12, tls13]
         params:
           blob:
-            values: [fake_default_tls]
+            values: [fake_default_tls, fake_dir_tls]
             default: fake_default_tls
           tls_mod:
             values: [none, random_sni, random_session_id]
@@ -200,7 +191,7 @@ families:
         protocols: [quic]
         params:
           blob:
-            values: [fake_default_quic]
+            values: [fake_default_quic, fake_dir_quic]
             default: fake_default_quic
           repeats:
             values: [1, 2, 5, 10, 20]
@@ -210,6 +201,39 @@ families:
             default: none
         render:
           lua_desync: "fake:payload=quic_initial:blob={{blob}}:repeats={{repeats}}{{fooling_suffix}}"
+
+  - id: rst
+    enabled: true
+    category: direct_reset_packet
+    protocols: [http, tls12, tls13]
+    cost: 4
+    risk: 3
+    prior: [2, 3]
+    actions:
+      - id: rst_http
+        function: rst
+        protocols: [http]
+        params:
+          rstack:
+            values: [false, true]
+            default: false
+          fooling:
+            values: [none, badsum, autottl, badsum_autottl]
+            default: badsum
+        render:
+          lua_desync: "rst:payload=http_req{{rstack_suffix}}{{fooling_suffix}}"
+      - id: rst_tls
+        function: rst
+        protocols: [tls12, tls13]
+        params:
+          rstack:
+            values: [false, true]
+            default: false
+          fooling:
+            values: [none, badsum, autottl, badsum_autottl]
+            default: badsum
+        render:
+          lua_desync: "rst:payload=tls_client_hello{{rstack_suffix}}{{fooling_suffix}}"
 
   - id: syndata
     enabled: true
@@ -224,7 +248,7 @@ families:
         protocols: [http]
         params:
           blob:
-            values: [fake_default_http]
+            values: [fake_default_http, fake_dir_http]
             default: fake_default_http
           fooling:
             values: [none, badsum, autottl]
@@ -236,7 +260,7 @@ families:
         protocols: [tls12, tls13]
         params:
           blob:
-            values: [fake_default_tls]
+            values: [fake_default_tls, fake_dir_tls]
             default: fake_default_tls
           fooling:
             values: [none, badsum, autottl]
@@ -349,6 +373,51 @@ families:
         render:
           lua_desync: "fakeddisorder:payload=tls_client_hello:pos={{pos}}{{fooling_suffix}}{{pattern_suffix}}"
 
+  - id: hostfake
+    enabled: true
+    category: host_fake_split
+    protocols: [http, tls12, tls13]
+    cost: 4
+    risk: 3
+    prior: [2, 2]
+    actions:
+      - id: hostfakesplit_http
+        function: hostfakesplit
+        protocols: [http]
+        params:
+          host_template:
+            values: [random, random.$1D, random.$2D, random.$3D]
+            default: random
+          midhost:
+            values: [none, midsld, host+1]
+            default: none
+          disorder_after:
+            values: [none, endhost, endhost+1]
+            default: none
+          fooling:
+            values: [badsum, autottl, badsum_autottl]
+            default: badsum
+        render:
+          lua_desync: "hostfakesplit:payload=http_req:host={{host_template}}{{midhost_suffix}}{{disorder_after_suffix}}{{fooling_suffix}}"
+      - id: hostfakesplit_tls
+        function: hostfakesplit
+        protocols: [tls12, tls13]
+        params:
+          host_template:
+            values: [random, random.$1D, random.$2D, random.$3D]
+            default: random
+          midhost:
+            values: [none, midsld, host+1]
+            default: none
+          disorder_after:
+            values: [none, endhost, endhost+1]
+            default: none
+          fooling:
+            values: [badsum, autottl, badsum_autottl]
+            default: badsum
+        render:
+          lua_desync: "hostfakesplit:payload=tls_client_hello:host={{host_template}}{{midhost_suffix}}{{disorder_after_suffix}}{{fooling_suffix}}"
+
   - id: ipfrag
     enabled: true
     category: ip_fragmentation
@@ -362,7 +431,7 @@ families:
         protocols: [http, tls12, tls13]
         params:
           blob:
-            values: [fake_default_http, fake_default_tls]
+            values: [fake_default_http, fake_default_tls, fake_dir_http, fake_dir_tls]
             default: fake_default_tls
           ipfrag_pos:
             values: [8, 16, 24, 32, 48, 64, 96]
@@ -389,7 +458,7 @@ families:
         protocols: [quic]
         params:
           blob:
-            values: [fake_default_quic]
+            values: [fake_default_quic, fake_dir_quic]
             default: fake_default_quic
           ipfrag_pos:
             values: [8, 16, 32, 64, 96]
@@ -513,24 +582,36 @@ candidate_generators:
       - family: fake
         actions: [fake_http]
         params:
-          blob: [fake_default_http]
+          blob: [fake_default_http, fake_dir_http]
           fooling: [none, badsum, autottl, badsum_autottl]
+      - family: rst
+        actions: [rst_http]
+        params:
+          rstack: [false, true]
+          fooling: [badsum, autottl, badsum_autottl]
       - family: faked_split
         actions: [fakedsplit_http]
         params:
-          pos: [host, host+1, midsld, endhost-1]
-          fooling: [badsum, autottl]
+          pos: [host, host+1, midsld, endhost-2, endhost-1]
+          fooling: [badsum, autottl, badsum_autottl]
           pattern: [zero, random]
-      - family: seqovl
-        actions: [multisplit_seqovl_http]
+      - family: hostfake
+        actions: [hostfakesplit_http]
         params:
-          pos: [host+1, midsld, endhost-1]
-          seqovl: [1, 2, 4, midsld-1]
+          host_template: [random, random.$1D, random.$2D, random.$3D]
+          midhost: [none, midsld, host+1]
+          disorder_after: [none, endhost, endhost+1]
+          fooling: [badsum, autottl, badsum_autottl]
+      - family: seqovl
+        actions: [multisplit_seqovl_http, tcpseg_seqovl]
+        params:
+          pos: [host+1, midsld, endhost-1, "0,-1", "0,midsld", "host,endhost"]
+          seqovl: [1, 2, 4, 8, midsld-1]
           seqovl_pattern: [zero, random]
       - family: ipfrag
         actions: [fake_ipfrag_tcp, multisplit_ipfrag_tcp]
         params:
-          blob: [fake_default_http]
+          blob: [fake_default_http, fake_dir_http]
           pos: [host+1, midsld]
           ipfrag_pos: [16, 24, 32, 48, 64]
           fooling: [none, badsum, autottl]
@@ -552,26 +633,38 @@ candidate_generators:
         params:
           pos: [1, 2, 3, sniext, sniext+1, sniext+4, host, host+1, midsld, endhost-2, endhost-1, endhost, extlen, -1, "2,midsld", "sniext+1,midsld", "host+1,midsld", "sniext+1,host+1,endhost-1"]
       - family: disorder
-        actions: [multidisorder_tls, multidisorder_legacy_tls]
+        actions: [multidisorder_tls]
         params:
           pos: [1, 2, sniext+1, sniext+4, host+1, midsld, endhost-1]
       - family: fake
         actions: [fake_tls]
         params:
-          blob: [fake_default_tls]
+          blob: [fake_default_tls, fake_dir_tls]
           fooling: [none, badsum, autottl, badsum_autottl]
           tls_mod: [none, random_sni, random_session_id]
+      - family: rst
+        actions: [rst_tls]
+        params:
+          rstack: [false, true]
+          fooling: [badsum, autottl, badsum_autottl]
       - family: syndata
         actions: [syndata_tls]
         params:
-          blob: [fake_default_tls]
+          blob: [fake_default_tls, fake_dir_tls]
           fooling: [none, badsum, autottl]
       - family: faked_split
         actions: [fakedsplit_tls, fakeddisorder_tls]
         params:
-          pos: [sniext+1, host+1, midsld, endhost-1]
+          pos: [sniext+1, sniext+4, host+1, midsld, endhost-2, endhost-1]
           fooling: [badsum, autottl, badsum_autottl]
           pattern: [zero, random]
+      - family: hostfake
+        actions: [hostfakesplit_tls]
+        params:
+          host_template: [random, random.$1D, random.$2D, random.$3D]
+          midhost: [none, midsld, host+1]
+          disorder_after: [none, endhost, endhost+1]
+          fooling: [badsum, autottl, badsum_autottl]
       - family: seqovl
         actions: [multisplit_seqovl_tls, tcpseg_seqovl]
         params:
@@ -581,7 +674,7 @@ candidate_generators:
       - family: ipfrag
         actions: [fake_ipfrag_tcp, multisplit_ipfrag_tcp]
         params:
-          blob: [fake_default_tls]
+          blob: [fake_default_tls, fake_dir_tls]
           pos: [sniext+1, host+1, midsld]
           ipfrag_pos: [8, 16, 24, 32, 48, 64, 96]
           fooling: [none, badsum, autottl]
@@ -603,21 +696,33 @@ candidate_generators:
         params:
           pos: [1, 2, 3, sniext, sniext+1, sniext+4, host, host+1, midsld, endhost-2, endhost-1, endhost, extlen, -1, "2,midsld", "sniext+1,midsld", "host+1,midsld", "sniext+1,host+1,endhost-1"]
       - family: disorder
-        actions: [multidisorder_tls, multidisorder_legacy_tls]
+        actions: [multidisorder_tls]
         params:
           pos: [1, 2, sniext+1, sniext+4, host+1, midsld, endhost-1]
       - family: fake
         actions: [fake_tls]
         params:
-          blob: [fake_default_tls]
+          blob: [fake_default_tls, fake_dir_tls]
           fooling: [none, badsum, autottl, badsum_autottl]
           tls_mod: [none, random_sni, random_session_id]
+      - family: rst
+        actions: [rst_tls]
+        params:
+          rstack: [false, true]
+          fooling: [badsum, autottl, badsum_autottl]
       - family: faked_split
         actions: [fakedsplit_tls, fakeddisorder_tls]
         params:
-          pos: [sniext+1, host+1, midsld, endhost-1]
+          pos: [sniext+1, sniext+4, host+1, midsld, endhost-2, endhost-1]
           fooling: [badsum, autottl, badsum_autottl]
           pattern: [zero, random]
+      - family: hostfake
+        actions: [hostfakesplit_tls]
+        params:
+          host_template: [random, random.$1D, random.$2D, random.$3D]
+          midhost: [none, midsld, host+1]
+          disorder_after: [none, endhost, endhost+1]
+          fooling: [badsum, autottl, badsum_autottl]
       - family: seqovl
         actions: [multisplit_seqovl_tls, tcpseg_seqovl]
         params:
@@ -627,7 +732,7 @@ candidate_generators:
       - family: ipfrag
         actions: [fake_ipfrag_tcp, multisplit_ipfrag_tcp]
         params:
-          blob: [fake_default_tls]
+          blob: [fake_default_tls, fake_dir_tls]
           pos: [sniext+1, host+1, midsld]
           ipfrag_pos: [8, 16, 24, 32, 48, 64, 96]
           fooling: [none, badsum, autottl]
@@ -641,13 +746,13 @@ candidate_generators:
       - family: fake
         actions: [fake_quic]
         params:
-          blob: [fake_default_quic]
+          blob: [fake_default_quic, fake_dir_quic]
           repeats: [1, 2, 5, 10, 20]
           fooling: [none, autottl]
       - family: ipfrag
         actions: [fake_ipfrag_udp]
         params:
-          blob: [fake_default_quic]
+          blob: [fake_default_quic, fake_dir_quic]
           ipfrag_pos: [8, 16, 32, 64, 96]
           repeats: [1, 2, 5]
       - family: udp_len
@@ -660,11 +765,11 @@ candidate_generators:
 
   expand:
     http:
-      family_order: [http_trick, split, disorder, fake, faked_split, seqovl, ipfrag, wsize, oob]
+      family_order: [http_trick, split, disorder, fake, rst, faked_split, hostfake, seqovl, ipfrag, wsize, oob]
     tls12:
-      family_order: [split, disorder, fake, syndata, faked_split, seqovl, ipfrag, wsize, oob]
+      family_order: [split, disorder, fake, rst, syndata, faked_split, hostfake, seqovl, ipfrag, wsize, oob]
     tls13:
-      family_order: [split, disorder, fake, syndata, faked_split, seqovl, ipfrag, wsize, oob]
+      family_order: [split, disorder, fake, rst, syndata, faked_split, hostfake, seqovl, ipfrag, wsize, oob]
     quic:
       family_order: [fake, ipfrag, udp_len]
 

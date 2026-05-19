@@ -3,8 +3,11 @@ use serde_yaml::{Mapping, Value};
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap, HashSet},
-    path::Path,
+    path::{Path, PathBuf},
 };
+
+const DEFAULT_FAKE_BLOB_DIR: &str = "/opt/zapret2/files/fake";
+const BLOB_FILE_SENTINEL: &str = "__zapret_checker_blob_file__";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StrategyNode {
@@ -373,7 +376,10 @@ fn append_family_actions(
             continue;
         }
         for lua in render_lua_desync_variants(root, action, overrides, use_action_values) {
-            let args_key = format!("--lua-desync={lua}");
+            let mut args = vec![format!("--lua-desync={lua}")];
+            apply_blob_file_options(&mut args);
+            ensure_payload_option(&mut args, Some(protocol_key));
+            let args_key = args.join("\0");
             if !seen.insert(args_key.clone()) {
                 continue;
             }
@@ -381,7 +387,7 @@ fn append_family_actions(
                 id: format!("{protocol_key}_{}_{}_{}", family.id, action.id, nodes.len()),
                 family: family.id.clone(),
                 action_id: action.id.clone(),
-                args: vec![args_key],
+                args,
                 cost: family.cost,
                 risk: family.risk,
                 prior: family.prior,
@@ -608,13 +614,161 @@ fn apply_suffixes(mut rendered: String, combo: &[(String, String)]) -> String {
         _ => "",
     };
 
+    let rstack_suffix = match get("rstack").unwrap_or("false") {
+        "true" => ":rstack",
+        _ => "",
+    };
+
+    let midhost_suffix = match get("midhost").unwrap_or("none") {
+        "none" => "".to_string(),
+        value => format!(":midhost={value}"),
+    };
+
+    let disorder_after_suffix = match get("disorder_after").unwrap_or("none") {
+        "none" => "".to_string(),
+        value => format!(":disorder_after={value}"),
+    };
+
     rendered = rendered.replace("{{fooling_suffix}}", fooling_suffix);
     rendered = rendered.replace("{{tls_mod_suffix}}", tls_mod_suffix);
     rendered = rendered.replace("{{pattern_suffix}}", pattern_suffix);
     rendered = rendered.replace("{{seqovl_pattern_suffix}}", seqovl_pattern_suffix);
+    rendered = rendered.replace("{{rstack_suffix}}", rstack_suffix);
+    rendered = rendered.replace("{{midhost_suffix}}", &midhost_suffix);
+    rendered = rendered.replace("{{disorder_after_suffix}}", &disorder_after_suffix);
     rendered = rendered.replace("{{ipfrag_suffix}}", "");
 
     rendered
+}
+
+fn explicit_lua_payload(lua: &str) -> Option<&str> {
+    lua.split(':')
+        .find_map(|part| part.strip_prefix("payload="))
+        .filter(|payload| !payload.is_empty())
+}
+
+fn ensure_payload_option(args: &mut Vec<String>, protocol_key: Option<&str>) {
+    if args
+        .iter()
+        .any(|arg| arg == "--payload" || arg.starts_with("--payload="))
+    {
+        return;
+    }
+    let payloads = lua_desync_payloads(args, protocol_key);
+    if payloads.is_empty() {
+        return;
+    }
+    let insert_at = args
+        .iter()
+        .position(|arg| arg == "--lua-desync" || arg.starts_with("--lua-desync="))
+        .unwrap_or(args.len());
+    args.insert(insert_at, format!("--payload={}", payloads.join(",")));
+}
+
+fn apply_blob_file_options(args: &mut Vec<String>) {
+    let mut blob_args = Vec::new();
+    for arg in args.iter_mut() {
+        let Some(lua) = arg.strip_prefix("--lua-desync=") else {
+            continue;
+        };
+        let (updated_lua, discovered) = replace_blob_file_sentinels(lua);
+        if !discovered.is_empty() {
+            *arg = format!("--lua-desync={updated_lua}");
+            blob_args.extend(discovered);
+        }
+    }
+    if blob_args.is_empty() {
+        return;
+    }
+    let insert_at = args
+        .iter()
+        .position(|arg| arg == "--lua-desync" || arg.starts_with("--lua-desync="))
+        .unwrap_or(args.len());
+    for (offset, blob_arg) in dedup_preserve_order(blob_args).into_iter().enumerate() {
+        args.insert(insert_at + offset, blob_arg);
+    }
+}
+
+fn replace_blob_file_sentinels(lua: &str) -> (String, Vec<String>) {
+    let mut parts = Vec::new();
+    let mut blob_args = Vec::new();
+    for part in lua.split(':') {
+        if let Some(value) = part.strip_prefix("blob=") {
+            if let Some((name, path)) = parse_blob_file_sentinel(value) {
+                parts.push(format!("blob={name}"));
+                blob_args.push(format!("--blob={name}:@{path}"));
+                continue;
+            }
+        }
+        parts.push(part.to_string());
+    }
+    (parts.join(":"), blob_args)
+}
+
+fn parse_blob_file_sentinel(value: &str) -> Option<(String, String)> {
+    let rest = value.strip_prefix(BLOB_FILE_SENTINEL)?;
+    let (name, path) = rest.split_once('@')?;
+    if name.is_empty() || path.is_empty() {
+        return None;
+    }
+    Some((name.to_string(), path.to_string()))
+}
+
+fn lua_desync_payloads(args: &[String], protocol_key: Option<&str>) -> Vec<String> {
+    let mut payloads = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let lua = if let Some(value) = arg.strip_prefix("--lua-desync=") {
+            Some(value)
+        } else if arg == "--lua-desync" {
+            iter.next().map(|value| value.as_str())
+        } else {
+            None
+        };
+        let Some(lua) = lua else {
+            continue;
+        };
+        let payload = explicit_lua_payload(lua).or_else(|| inferred_lua_payload(lua, protocol_key));
+        if let Some(payload) = payload {
+            for item in payload.split(',').filter(|item| !item.is_empty()) {
+                if !payloads.iter().any(|seen| seen == item) {
+                    payloads.push(item.to_string());
+                }
+            }
+        }
+    }
+    payloads
+}
+
+fn inferred_lua_payload<'a>(lua: &str, protocol_key: Option<&'a str>) -> Option<&'a str> {
+    if !lua_function_uses_standard_payload(lua_function_name(lua)) {
+        return None;
+    }
+    match protocol_key {
+        Some("http") => Some("http_req"),
+        Some("tls12") | Some("tls13") => Some("tls_client_hello"),
+        Some("quic") => Some("quic_initial"),
+        _ => None,
+    }
+}
+
+fn lua_function_name(lua: &str) -> &str {
+    lua.split(':').next().unwrap_or(lua)
+}
+
+fn lua_function_uses_standard_payload(function: &str) -> bool {
+    matches!(
+        function,
+        "drop"
+            | "fake"
+            | "rst"
+            | "multisplit"
+            | "multidisorder"
+            | "fakedsplit"
+            | "fakeddisorder"
+            | "tcpseg"
+            | "udplen"
+    )
 }
 
 fn param_combinations(
@@ -662,6 +816,7 @@ fn merged_param_values(
                 .and_then(|m| m.get(Value::String(name.to_string())))
                 .map(values_from_yaml)
                 .unwrap_or_else(|| param_values_from_action(root, def, use_action_values));
+            let values = expand_dynamic_param_values(name, values);
             if !values.is_empty() {
                 seen.insert(name.to_string());
                 out.push((name.to_string(), values));
@@ -678,12 +833,134 @@ fn merged_param_values(
                 continue;
             }
             let values = values_from_yaml(value);
+            let values = expand_dynamic_param_values(name, values);
             if !values.is_empty() {
                 out.push((name.to_string(), values));
             }
         }
     }
 
+    out
+}
+
+fn expand_dynamic_param_values(name: &str, values: Vec<String>) -> Vec<String> {
+    if name != "blob" {
+        return values;
+    }
+
+    let mut out = Vec::new();
+    for value in values {
+        if let Some((kind, dir)) = parse_fake_dir_marker(&value) {
+            out.extend(fake_blob_files(kind, &dir));
+        } else {
+            out.push(value);
+        }
+    }
+    dedup_preserve_order(out)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FakeBlobKind {
+    Http,
+    Tls,
+    Quic,
+    All,
+}
+
+fn parse_fake_dir_marker(value: &str) -> Option<(FakeBlobKind, PathBuf)> {
+    let (marker, dir) = value
+        .split_once(':')
+        .map(|(marker, dir)| (marker, PathBuf::from(dir)))
+        .unwrap_or((value, PathBuf::from(DEFAULT_FAKE_BLOB_DIR)));
+    let kind = match marker {
+        "fake_dir_http" => FakeBlobKind::Http,
+        "fake_dir_tls" => FakeBlobKind::Tls,
+        "fake_dir_quic" => FakeBlobKind::Quic,
+        "fake_dir_all" => FakeBlobKind::All,
+        _ => return None,
+    };
+    Some((kind, dir))
+}
+
+fn fake_blob_files(kind: FakeBlobKind, dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_file() || !fake_blob_kind_matches(&path, kind) {
+                return None;
+            }
+            Some(blob_file_sentinel(kind, &path))
+        })
+        .collect::<Vec<_>>();
+    out.sort();
+    out
+}
+
+fn blob_file_sentinel(kind: FakeBlobKind, path: &Path) -> String {
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("blob");
+    let kind = match kind {
+        FakeBlobKind::Http => "http",
+        FakeBlobKind::Tls => "tls",
+        FakeBlobKind::Quic => "quic",
+        FakeBlobKind::All => "fake",
+    };
+    let name = sanitize_blob_name(&format!("fake_{kind}_{filename}"));
+    format!("{BLOB_FILE_SENTINEL}{name}@{}", path.to_string_lossy())
+}
+
+fn sanitize_blob_name(value: &str) -> String {
+    let mut out = value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if out
+        .chars()
+        .next()
+        .is_none_or(|c| !(c.is_ascii_alphabetic() || c == '_'))
+    {
+        out.insert(0, '_');
+    }
+    out
+}
+
+fn fake_blob_kind_matches(path: &std::path::Path, kind: FakeBlobKind) -> bool {
+    if matches!(kind, FakeBlobKind::All) {
+        return true;
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match kind {
+        FakeBlobKind::Http => name.contains("http"),
+        FakeBlobKind::Tls => name.contains("tls") || name.contains("ssl"),
+        FakeBlobKind::Quic => name.contains("quic"),
+        FakeBlobKind::All => true,
+    }
+}
+
+fn dedup_preserve_order(values: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for value in values {
+        if seen.insert(value.clone()) {
+            out.push(value);
+        }
+    }
     out
 }
 

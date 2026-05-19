@@ -1,9 +1,9 @@
 [workers]
-count = 4
+count = 64
 
 [queue]
-base_qnum = 200
-qnum_count = 64
+base_qnum = 10
+qnum_count = 164
 
 [source_port]
 mode = "os_assigned"
@@ -17,11 +17,18 @@ tls_timeout_ms = 3000
 first_byte_timeout_ms = 5000
 total_timeout_ms = 10000
 max_read_bytes = 65536
-user_agent = "zapret-checker"
-path = "/"
+user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:150.0) Gecko/20100101 Firefox/150.0"
+method = "GET"
+read_mode = "body"
+min_body_bytes = 32000
+test_count = 5
+base_domains = [
+  "youtube.com",
+  "istio.io",
+]
 
 [probe.protocols]
-http = false
+http = true
 tls12 = true
 tls13 = false
 quic = true
@@ -59,11 +66,11 @@ verbose_nfqws = false
 file = "config/standart/strategies.yaml"
 transition_matrix = "config/standart/transition_matrix.yaml"
 soft_fail_family_limit = 6
-successful_strategy_limit = 40
+successful_strategy_limit = 80
 search_mode = "expand"
-max_candidates = 300
-max_per_family = 24
-max_per_action = 8
+max_candidates = 1000
+max_per_family = 64
+max_per_action = 20
 round_robin_families = true
 
 [bayes]
