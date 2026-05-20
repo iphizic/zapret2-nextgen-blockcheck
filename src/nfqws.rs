@@ -173,6 +173,10 @@ impl NfqwsManager for ProcessNfqwsManager {
 }
 
 fn rendered_args(cfg: &NfqwsInstanceConfig) -> Vec<String> {
+    build_nfqws_args(cfg)
+}
+
+pub fn build_nfqws_args(cfg: &NfqwsInstanceConfig) -> Vec<String> {
     let mut args = cfg.base_args.clone();
     args.push(format!("--qnum={}", cfg.qnum));
     args.extend(cfg.strategy_args.clone());

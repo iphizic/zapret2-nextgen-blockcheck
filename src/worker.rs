@@ -1,4 +1,4 @@
-use crate::{firewall::*, nfqws::*, probe::*, queue::*, types::*};
+use crate::{firewall::*, isolation::IsolationMode, nfqws::*, probe::*, types::*};
 use std::{
     path::PathBuf,
     sync::Arc,
@@ -7,9 +7,16 @@ use std::{
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerAssignment {
+    pub worker_id: usize,
+    pub qnum: u16,
+    pub fwmark: Option<u32>,
+    pub source_port: Option<u16>,
+}
+
 #[derive(Clone)]
 pub struct WorkerRuntime {
-    pub queue_allocator: QueueAllocator,
     pub firewall: Arc<dyn FirewallManager>,
     pub nfqws: Arc<dyn NfqwsManager>,
     pub native_probe: NativeTcpTlsHttpProbe,
@@ -20,34 +27,49 @@ pub struct WorkerRuntime {
     pub nfqws_log_stdout: bool,
     pub nfqws_log_stderr: bool,
     pub firewall_hook: FirewallHook,
+    pub isolation_mode: IsolationMode,
 }
 
 impl WorkerRuntime {
     pub async fn run_strategy_task(
         &self,
         task: StrategyTask,
-        worker_id: usize,
+        assignment: WorkerAssignment,
         cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> ProbeResult {
-        self.run_worker_task(ProbeTask::from_strategy_task(task, worker_id), cancellation)
-            .await
+        self.run_worker_task(
+            ProbeTask::from_strategy_task(task, assignment.worker_id),
+            assignment,
+            cancellation,
+        )
+        .await
     }
 
     pub async fn run_worker_task(
         &self,
         task: ProbeTask,
+        assignment: WorkerAssignment,
         cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> ProbeResult {
         let total_start = Instant::now();
-        let prepared = match self
-            .native_probe
-            .prepare_transport(task.protocol, task.target_ip)
-        {
+        let prepared = match self.isolation_mode {
+            IsolationMode::SourcePort => self
+                .native_probe
+                .prepare_transport(task.protocol, task.target_ip),
+            IsolationMode::Fwmark => self.native_probe.prepare_transport_fwmark(
+                task.protocol,
+                task.target_ip,
+                assignment
+                    .fwmark
+                    .expect("fwmark assignment required in fwmark isolation mode"),
+            ),
+        };
+        let prepared = match prepared {
             Ok(s) => s,
             Err(e) => {
                 return ProbeResult::infrastructure_failure(
                     &task,
-                    None,
+                    Some(assignment.qnum),
                     None,
                     ProbeErrorClass::BindFailed,
                     e.to_string(),
@@ -55,24 +77,18 @@ impl WorkerRuntime {
                 );
             }
         };
-        let source_port = prepared.assigned_source_port;
+        let mut source_port = prepared.assigned_source_port;
+        let qnum = assignment.qnum;
 
-        let qlease = match self.queue_allocator.acquire().await {
-            Ok(q) => q,
-            Err(e) => {
-                return ProbeResult::infrastructure_failure(
-                    &task,
-                    None,
-                    Some(source_port),
-                    ProbeErrorClass::QueueUnavailable,
-                    e.to_string(),
-                    total_start.elapsed().as_millis() as u64,
-                )
-            }
-        };
-        let qnum = qlease.qnum;
-
-        debug!(worker_id = task.worker_id, strategy_id = %task.strategy_id, qnum, source_port, "prepared socket");
+        debug!(
+            worker_id = task.worker_id,
+            strategy_id = %task.strategy_id,
+            qnum,
+            source_port,
+            fwmark = ?assignment.fwmark,
+            isolation = ?self.isolation_mode,
+            "prepared socket"
+        );
 
         let nfq_cfg = NfqwsInstanceConfig {
             qnum,
@@ -89,7 +105,6 @@ impl WorkerRuntime {
         let nfq_handle = match self.nfqws.start(nfq_cfg).await {
             Ok(h) => h,
             Err(e) => {
-                qlease.release().await;
                 return ProbeResult::infrastructure_failure(
                     &task,
                     Some(qnum),
@@ -101,6 +116,7 @@ impl WorkerRuntime {
             }
         };
 
+        let per_task_rule = self.isolation_mode == IsolationMode::SourcePort;
         let rule = WorkerFirewallRule {
             worker_id: task.worker_id,
             qnum,
@@ -113,17 +129,18 @@ impl WorkerRuntime {
             },
             hook: self.firewall_hook,
         };
-        if let Err(e) = self.firewall.install_worker_rule(rule.clone()).await {
-            let _ = self.nfqws.stop(nfq_handle).await;
-            qlease.release().await;
-            return ProbeResult::infrastructure_failure(
-                &task,
-                Some(qnum),
-                Some(source_port),
-                ProbeErrorClass::FirewallInstallFailed,
-                e.to_string(),
-                total_start.elapsed().as_millis() as u64,
-            );
+        if per_task_rule {
+            if let Err(e) = self.firewall.install_worker_rule(rule.clone()).await {
+                let _ = self.nfqws.stop(nfq_handle).await;
+                return ProbeResult::infrastructure_failure(
+                    &task,
+                    Some(qnum),
+                    Some(source_port),
+                    ProbeErrorClass::FirewallInstallFailed,
+                    e.to_string(),
+                    total_start.elapsed().as_millis() as u64,
+                );
+            }
         }
         let setup_ms = total_start.elapsed().as_millis() as u64;
 
@@ -162,17 +179,26 @@ impl WorkerRuntime {
                 bytes_read: 0,
                 header_bytes: 0,
                 body_bytes: 0,
+                total_bytes: 0,
+                transfer_level: TransferLevel::None,
+                dpi_suspicious: false,
                 failure_kind: Some(FailureKind::StrategyFailure),
                 error_class: Some(ProbeErrorClass::ReadTimeout),
                 error_message: Some("total timeout".into()),
             },
         };
 
+        if result.assigned_source_port.unwrap_or(0) != 0 {
+            source_port = result.assigned_source_port.unwrap_or(source_port);
+        }
+
         result.setup_ms = Some(setup_ms);
-        if let Err(e) = self.firewall.remove_worker_rule(rule).await {
-            warn!(worker_id = task.worker_id, qnum, error = %e, "firewall remove failed");
-            if result.error_class.is_none() {
-                result.error_class = Some(ProbeErrorClass::FirewallRemoveFailed);
+        if per_task_rule {
+            if let Err(e) = self.firewall.remove_worker_rule(rule).await {
+                warn!(worker_id = task.worker_id, qnum, error = %e, "firewall remove failed");
+                if result.error_class.is_none() {
+                    result.error_class = Some(ProbeErrorClass::FirewallRemoveFailed);
+                }
             }
         }
         if let Err(e) = self.nfqws.stop(nfq_handle).await {
@@ -181,7 +207,6 @@ impl WorkerRuntime {
                 result.error_class = Some(ProbeErrorClass::NfqwsStopFailed);
             }
         }
-        qlease.release().await;
         result.qnum = Some(qnum);
         result.assigned_source_port = Some(source_port);
         debug!(
@@ -189,6 +214,7 @@ impl WorkerRuntime {
             strategy_id = %result.strategy_id,
             qnum,
             assigned_source_port = source_port,
+            fwmark = ?assignment.fwmark,
             target_host = %result.target_host,
             target_ip = %result.target_ip,
             target_port = result.target_port,

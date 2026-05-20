@@ -1,8 +1,9 @@
-use crate::types::*;
+use crate::{socket_mark::SocketMarkSetter, types::*};
 use async_trait::async_trait;
 use quinn::{ClientConfig as QuinnClientConfig, Endpoint};
 use rustls::{ClientConfig, RootCertStore};
 use rustls_pki_types::{CertificateDer, ServerName};
+use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     future::Future,
     net::{IpAddr, SocketAddr},
@@ -41,6 +42,8 @@ pub enum ProbeError {
     Bind(std::io::Error),
     #[error("local_addr failed: {0}")]
     LocalAddr(std::io::Error),
+    #[error("socket mark failed: {0}")]
+    SocketMark(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +113,41 @@ impl NativeTcpTlsHttpProbe {
         }
     }
 
+    pub fn prepare_transport_fwmark(
+        &self,
+        protocol: ProbeProtocol,
+        target_ip: IpAddr,
+        fwmark: u32,
+    ) -> Result<PreparedSocket, ProbeError> {
+        match protocol {
+            ProbeProtocol::QuicHttp3Future => self.prepare_quic_endpoint(target_ip),
+            _ => self.prepare_tcp_socket_fwmark(target_ip, fwmark),
+        }
+    }
+
+    fn prepare_tcp_socket_fwmark(
+        &self,
+        target_ip: IpAddr,
+        fwmark: u32,
+    ) -> Result<PreparedSocket, ProbeError> {
+        let domain = match target_ip {
+            IpAddr::V4(_) => Domain::IPV4,
+            IpAddr::V6(_) => Domain::IPV6,
+        };
+        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
+            .map_err(ProbeError::SocketCreate)?;
+        socket
+            .set_mark(fwmark)
+            .map_err(|error| ProbeError::SocketMark(error.to_string()))?;
+        socket.set_nonblocking(true).map_err(ProbeError::Bind)?;
+        let std_stream: std::net::TcpStream = socket.into();
+        let tcp_socket = TcpSocket::from_std_stream(std_stream);
+        Ok(PreparedSocket {
+            transport: PreparedTransport::Tcp(tcp_socket),
+            assigned_source_port: 0,
+        })
+    }
+
     fn prepare_tcp_socket(&self, target_ip: IpAddr) -> Result<PreparedSocket, ProbeError> {
         let socket = match target_ip {
             IpAddr::V4(_) => TcpSocket::new_v4().map_err(ProbeError::SocketCreate)?,
@@ -151,7 +189,7 @@ impl NativeTcpTlsHttpProbe {
         let total_start = Instant::now();
         let mut connect_ms = None;
         let remote = SocketAddr::new(task.target_ip, task.target_port);
-        let assigned_source_port = prepared.assigned_source_port;
+        let mut assigned_source_port = prepared.assigned_source_port;
 
         if let Some(token) = &ctx.cancellation {
             if token.is_cancelled() {
@@ -160,6 +198,7 @@ impl NativeTcpTlsHttpProbe {
                     ctx.qnum,
                     assigned_source_port,
                     total_start.elapsed().as_millis() as u64,
+                    ctx.baseline,
                 );
             }
         }
@@ -184,6 +223,11 @@ impl NativeTcpTlsHttpProbe {
         {
             Ok(Ok(s)) => {
                 connect_ms = Some(connect_start.elapsed().as_millis() as u64);
+                if assigned_source_port == 0 {
+                    if let Ok(local) = s.local_addr() {
+                        assigned_source_port = local.port();
+                    }
+                }
                 s
             }
             Ok(Err(e)) => {
@@ -199,6 +243,8 @@ impl NativeTcpTlsHttpProbe {
                     connect_ms,
                     None,
                     None,
+                    None,
+                    ctx.baseline,
                 )
             }
             Err(ProbeWaitError::Timeout) => {
@@ -214,6 +260,8 @@ impl NativeTcpTlsHttpProbe {
                     connect_ms,
                     None,
                     None,
+                    None,
+                    ctx.baseline,
                 )
             }
             Err(ProbeWaitError::Cancelled) => {
@@ -222,6 +270,7 @@ impl NativeTcpTlsHttpProbe {
                     ctx.qnum,
                     assigned_source_port,
                     total_start.elapsed().as_millis() as u64,
+                    ctx.baseline,
                 )
             }
         };
@@ -277,6 +326,8 @@ impl NativeTcpTlsHttpProbe {
                 connect_ms,
                 None,
                 None,
+                None,
+                ctx.baseline,
             ),
         }
     }
@@ -305,6 +356,8 @@ impl NativeTcpTlsHttpProbe {
                     None,
                     None,
                     None,
+                    None,
+                    ctx.baseline,
                 )
             }
         };
@@ -330,6 +383,8 @@ impl NativeTcpTlsHttpProbe {
                     None,
                     None,
                     None,
+                    None,
+                    ctx.baseline,
                 )
             }
         };
@@ -355,6 +410,8 @@ impl NativeTcpTlsHttpProbe {
                     None,
                     None,
                     None,
+                    None,
+                    ctx.baseline,
                 )
             }
             Err(ProbeWaitError::Timeout) => {
@@ -370,6 +427,8 @@ impl NativeTcpTlsHttpProbe {
                     None,
                     None,
                     None,
+                    None,
+                    ctx.baseline,
                 )
             }
             Err(ProbeWaitError::Cancelled) => {
@@ -378,6 +437,7 @@ impl NativeTcpTlsHttpProbe {
                     ctx.qnum,
                     source_port,
                     total_start.elapsed().as_millis() as u64,
+                    ctx.baseline,
                 )
             }
         };
@@ -385,32 +445,21 @@ impl NativeTcpTlsHttpProbe {
         connection.close(0u32.into(), b"zapret-checker");
         endpoint.close(0u32.into(), b"zapret-checker");
 
-        ProbeResult {
-            strategy_id: task.strategy_id,
-            worker_id: task.worker_id,
-            qnum: if ctx.baseline { None } else { Some(ctx.qnum) },
-            assigned_source_port: Some(source_port),
-            target_host: task.target_host,
-            target_ip: task.target_ip,
-            target_port: task.target_port,
-            protocol: task.protocol,
-            path: task.request.path_and_query,
-            method: task.request.method,
-            read_mode: task.request.read_mode,
-            setup_ms: None,
+        failure(
+            &task,
+            ctx.qnum,
+            source_port,
+            ProbeOutcome::InternalError,
+            FailureKind::InfrastructureFailure,
+            ProbeErrorClass::InternalError,
+            "QUIC probe does not verify HTTP transfer",
+            total_start,
             connect_ms,
-            tls_ms: connect_ms,
-            first_byte_ms: None,
-            total_ms: total_start.elapsed().as_millis() as u64,
-            outcome: ProbeOutcome::Success,
-            http_status: None,
-            bytes_read: 0,
-            header_bytes: 0,
-            body_bytes: 0,
-            failure_kind: None,
-            error_class: None,
-            error_message: None,
-        }
+            connect_ms,
+            None,
+            None,
+            ctx.baseline,
+        )
     }
 
     async fn https_http11(
@@ -437,6 +486,8 @@ impl NativeTcpTlsHttpProbe {
                 connect_ms,
                 None,
                 None,
+                None,
+                ctx.baseline,
             );
         }
         let tls_config = match tls_version {
@@ -460,6 +511,8 @@ impl NativeTcpTlsHttpProbe {
                     connect_ms,
                     None,
                     None,
+                    None,
+                    ctx.baseline,
                 )
             }
         };
@@ -485,6 +538,8 @@ impl NativeTcpTlsHttpProbe {
                     connect_ms,
                     None,
                     None,
+                    None,
+                    ctx.baseline,
                 )
             }
             Err(ProbeWaitError::Timeout) => {
@@ -500,6 +555,8 @@ impl NativeTcpTlsHttpProbe {
                     connect_ms,
                     None,
                     None,
+                    None,
+                    ctx.baseline,
                 )
             }
             Err(ProbeWaitError::Cancelled) => {
@@ -508,6 +565,7 @@ impl NativeTcpTlsHttpProbe {
                     ctx.qnum,
                     source_port,
                     total_start.elapsed().as_millis() as u64,
+                    ctx.baseline,
                 )
             }
         };
@@ -565,6 +623,8 @@ impl NativeTcpTlsHttpProbe {
                 connect_ms,
                 tls_ms,
                 None,
+                None,
+                ctx.baseline,
             );
         }
         let first_byte_start = Instant::now();
@@ -591,6 +651,8 @@ impl NativeTcpTlsHttpProbe {
                     connect_ms,
                     tls_ms,
                     None,
+                    None,
+                    ctx.baseline,
                 )
             }
             Ok(Ok(n)) => n,
@@ -607,6 +669,8 @@ impl NativeTcpTlsHttpProbe {
                     connect_ms,
                     tls_ms,
                     None,
+                    None,
+                    ctx.baseline,
                 )
             }
             Err(ProbeWaitError::Timeout) => {
@@ -622,6 +686,8 @@ impl NativeTcpTlsHttpProbe {
                     connect_ms,
                     tls_ms,
                     None,
+                    None,
+                    ctx.baseline,
                 )
             }
             Err(ProbeWaitError::Cancelled) => {
@@ -630,6 +696,7 @@ impl NativeTcpTlsHttpProbe {
                     ctx.qnum,
                     source_port,
                     total_start.elapsed().as_millis() as u64,
+                    ctx.baseline,
                 )
             }
         };
@@ -651,6 +718,7 @@ impl NativeTcpTlsHttpProbe {
                         ctx.qnum,
                         source_port,
                         total_start.elapsed().as_millis() as u64,
+                        ctx.baseline,
                     );
                 }
             }
@@ -676,6 +744,8 @@ impl NativeTcpTlsHttpProbe {
                     connect_ms,
                     tls_ms,
                     first_byte_ms,
+                    Some(&read),
+                    ctx.baseline,
                 );
             }
             let remaining = max_read_bytes - buf.len();
@@ -714,6 +784,8 @@ impl NativeTcpTlsHttpProbe {
                         connect_ms,
                         tls_ms,
                         first_byte_ms,
+                        Some(&read),
+                        ctx.baseline,
                     );
                 }
                 Err(ProbeWaitError::Timeout) => {
@@ -737,6 +809,8 @@ impl NativeTcpTlsHttpProbe {
                         connect_ms,
                         tls_ms,
                         first_byte_ms,
+                        Some(&read),
+                        ctx.baseline,
                     );
                 }
                 Err(ProbeWaitError::Cancelled) => {
@@ -745,6 +819,7 @@ impl NativeTcpTlsHttpProbe {
                         ctx.qnum,
                         source_port,
                         total_start.elapsed().as_millis() as u64,
+                        ctx.baseline,
                     )
                 }
             }
@@ -763,34 +838,116 @@ impl NativeTcpTlsHttpProbe {
         } else {
             Some(probe_failure_kind(ctx.baseline))
         };
-
-        ProbeResult {
-            strategy_id: task.strategy_id,
-            worker_id: task.worker_id,
-            qnum: if ctx.baseline { None } else { Some(ctx.qnum) },
-            assigned_source_port: Some(source_port),
-            target_host: task.target_host,
-            target_ip: task.target_ip,
-            target_port: task.target_port,
-            protocol: task.protocol,
-            path: task.request.path_and_query,
-            method: task.request.method,
-            read_mode: task.request.read_mode,
-            setup_ms: None,
+        build_http_probe_result(
+            &task,
+            &ctx,
+            source_port,
+            total_start,
             connect_ms,
             tls_ms,
-            first_byte_ms,
-            total_ms: total_start.elapsed().as_millis() as u64,
+            &read,
             outcome,
-            http_status: read.status,
-            bytes_read: read.total_bytes,
-            header_bytes: read.header_bytes,
-            body_bytes: read.body_bytes,
             failure_kind,
             error_class,
             error_message,
-        }
+        )
     }
+}
+
+fn build_http_probe_result(
+    task: &ProbeTask,
+    ctx: &ProbeContext,
+    source_port: u16,
+    total_start: Instant,
+    connect_ms: Option<u64>,
+    tls_ms: Option<u64>,
+    read: &HttpResponseRead,
+    outcome: ProbeOutcome,
+    failure_kind: Option<FailureKind>,
+    error_class: Option<ProbeErrorClass>,
+    error_message: Option<String>,
+) -> ProbeResult {
+    let uses_tls = matches!(
+        task.protocol,
+        ProbeProtocol::Tls12Http11 | ProbeProtocol::Tls13Http11
+    );
+    let response_started = read.first_byte_ms.is_some() || read.total_bytes > 0;
+    let transfer_level = compute_transfer_level(
+        connect_ms,
+        tls_ms,
+        read,
+        task.request.verify_transfer_bytes,
+        uses_tls,
+    );
+    let dpi_suspicious = compute_dpi_suspicious(
+        response_started,
+        read.total_bytes,
+        task.request.dpi_detection_bytes,
+        outcome,
+    );
+    ProbeResult {
+        strategy_id: task.strategy_id.clone(),
+        worker_id: task.worker_id,
+        qnum: if ctx.baseline { None } else { Some(ctx.qnum) },
+        assigned_source_port: Some(source_port),
+        target_host: task.target_host.clone(),
+        target_ip: task.target_ip,
+        target_port: task.target_port,
+        protocol: task.protocol,
+        path: task.request.path_and_query.clone(),
+        method: task.request.method,
+        read_mode: task.request.read_mode,
+        setup_ms: None,
+        connect_ms,
+        tls_ms,
+        first_byte_ms: read.first_byte_ms,
+        total_ms: total_start.elapsed().as_millis() as u64,
+        outcome,
+        http_status: read.status,
+        bytes_read: read.total_bytes,
+        header_bytes: read.header_bytes,
+        body_bytes: read.body_bytes,
+        total_bytes: read.total_bytes,
+        transfer_level,
+        dpi_suspicious,
+        failure_kind,
+        error_class,
+        error_message,
+    }
+}
+
+pub fn compute_transfer_level(
+    connect_ms: Option<u64>,
+    tls_ms: Option<u64>,
+    read: &HttpResponseRead,
+    verify_transfer_bytes: usize,
+    uses_tls: bool,
+) -> TransferLevel {
+    if connect_ms.is_none() {
+        return TransferLevel::None;
+    }
+    if read.body_bytes >= verify_transfer_bytes {
+        return TransferLevel::Verified;
+    }
+    if read.body_bytes > 0 {
+        return TransferLevel::Body;
+    }
+    if read.headers_complete {
+        return TransferLevel::Headers;
+    }
+    if uses_tls && tls_ms.is_some() {
+        return TransferLevel::TlsHandshake;
+    }
+    TransferLevel::Connected
+}
+
+pub fn compute_dpi_suspicious(
+    response_started: bool,
+    total_bytes: usize,
+    dpi_detection_bytes: usize,
+    outcome: ProbeOutcome,
+) -> bool {
+    response_started && total_bytes < dpi_detection_bytes && outcome != ProbeOutcome::Success
 }
 
 fn http_timeout_can_succeed(
@@ -924,6 +1081,9 @@ impl ProbeBackend for NativeTcpTlsHttpProbe {
                     bytes_read: 0,
                     header_bytes: 0,
                     body_bytes: 0,
+                    total_bytes: 0,
+                    transfer_level: TransferLevel::None,
+                    dpi_suspicious: false,
                     failure_kind: Some(probe_failure_kind(ctx.baseline)),
                     error_class: Some(ProbeErrorClass::ReadTimeout),
                     error_message: Some("total timeout".into()),
@@ -950,6 +1110,9 @@ impl ProbeBackend for NativeTcpTlsHttpProbe {
                     bytes_read: 0,
                     header_bytes: 0,
                     body_bytes: 0,
+                    total_bytes: 0,
+                    transfer_level: TransferLevel::None,
+                    dpi_suspicious: false,
                     failure_kind: Some(FailureKind::Cancelled),
                     error_class: Some(ProbeErrorClass::Cancelled),
                     error_message: Some("cancelled".into()),
@@ -1059,6 +1222,8 @@ impl ProbeBackend for CurlProbeFallback {
                     None,
                     None,
                     None,
+                    None,
+                    ctx.baseline,
                 )
             }
         };
@@ -1102,6 +1267,32 @@ impl ProbeBackend for CurlProbeFallback {
         } else {
             Some(FailureKind::InfrastructureFailure)
         };
+        let total_bytes = header_bytes + body_bytes;
+        let read = HttpResponseRead {
+            status,
+            header_bytes,
+            body_bytes,
+            total_bytes,
+            first_byte_ms: None,
+            headers_complete,
+        };
+        let uses_tls = matches!(
+            task.protocol,
+            ProbeProtocol::Tls12Http11 | ProbeProtocol::Tls13Http11
+        );
+        let transfer_level = compute_transfer_level(
+            None,
+            None,
+            &read,
+            task.request.verify_transfer_bytes,
+            uses_tls,
+        );
+        let dpi_suspicious = compute_dpi_suspicious(
+            headers_complete,
+            total_bytes,
+            task.request.dpi_detection_bytes,
+            outcome,
+        );
         ProbeResult {
             strategy_id: task.strategy_id,
             worker_id: task.worker_id,
@@ -1121,9 +1312,12 @@ impl ProbeBackend for CurlProbeFallback {
             total_ms: start.elapsed().as_millis() as u64,
             outcome,
             http_status: status,
-            bytes_read: header_bytes + body_bytes,
+            bytes_read: total_bytes,
             header_bytes,
             body_bytes,
+            total_bytes,
+            transfer_level,
+            dpi_suspicious,
             failure_kind,
             error_class,
             error_message,
@@ -1183,7 +1377,13 @@ pub fn parse_http_response_read(bytes: &[u8], first_byte_ms: Option<u64>) -> Htt
     }
 }
 
-fn cancelled_result(task: &ProbeTask, qnum: u16, source_port: u16, total_ms: u64) -> ProbeResult {
+fn cancelled_result(
+    task: &ProbeTask,
+    qnum: u16,
+    source_port: u16,
+    total_ms: u64,
+    baseline: bool,
+) -> ProbeResult {
     failure(
         task,
         qnum,
@@ -1196,6 +1396,8 @@ fn cancelled_result(task: &ProbeTask, qnum: u16, source_port: u16, total_ms: u64
         None,
         None,
         None,
+        None,
+        baseline,
     )
 }
 
@@ -1236,15 +1438,19 @@ fn probe_failure_kind(baseline: bool) -> FailureKind {
 #[allow(dead_code)]
 pub fn probe_outcome_for_http_status(status: Option<u16>) -> ProbeOutcome {
     match status {
-        Some(200..=399) => ProbeOutcome::Success,
-        Some(403) | Some(451) => ProbeOutcome::HttpBlockPage,
-        Some(_) => ProbeOutcome::HttpBlockPage,
+        Some(status) if is_http_block_status(status) => ProbeOutcome::HttpBlockPage,
+        Some(status) if status_is_success(Some(status)) => ProbeOutcome::Success,
+        Some(_) => ProbeOutcome::EmptyResponse,
         None => ProbeOutcome::EmptyResponse,
     }
 }
 
 fn status_is_success(status: Option<u16>) -> bool {
-    matches!(status, Some(200..=399))
+    matches!(status, Some(s) if (200..400).contains(&s))
+}
+
+fn is_http_block_status(status: u16) -> bool {
+    matches!(status, 403 | 451)
 }
 
 pub fn classify_http_response(
@@ -1269,7 +1475,23 @@ pub fn classify_http_response(
             Some("invalid HTTP response status".into()),
         );
     }
-    if status_is_success(status) {
+    if let Some(status) = status {
+        if is_http_block_status(status) {
+            return (
+                ProbeOutcome::HttpBlockPage,
+                Some(ProbeErrorClass::InvalidHttpResponse),
+                Some("HTTP block page/status".into()),
+            );
+        }
+
+        if !status_is_success(Some(status)) {
+            return (
+                ProbeOutcome::EmptyResponse,
+                Some(ProbeErrorClass::InvalidHttpResponse),
+                Some(format!("HTTP status {status} not in 2xx/3xx")),
+            );
+        }
+
         if method == HttpMethod::Head || read_mode == ReadMode::Headers {
             return (ProbeOutcome::Success, None, None);
         }
@@ -1284,18 +1506,12 @@ pub fn classify_http_response(
             )),
         );
     }
-    match status {
-        Some(403 | 451 | 400..=599) => (
-            ProbeOutcome::HttpBlockPage,
-            Some(ProbeErrorClass::InvalidHttpResponse),
-            Some("HTTP block page/status".into()),
-        ),
-        _ => (
-            ProbeOutcome::EmptyResponse,
-            Some(ProbeErrorClass::InvalidHttpResponse),
-            Some("unexpected HTTP status".into()),
-        ),
-    }
+
+    (
+        ProbeOutcome::EmptyResponse,
+        Some(ProbeErrorClass::InvalidHttpResponse),
+        Some("unexpected HTTP status".into()),
+    )
 }
 
 fn http_read_criteria_met(
@@ -1308,6 +1524,12 @@ fn http_read_criteria_met(
         return false;
     }
     if method == HttpMethod::Head || read_mode == ReadMode::Headers {
+        return true;
+    }
+    if matches!(read.status, Some(status) if is_http_block_status(status)) {
+        return true;
+    }
+    if matches!(read.status, Some(status) if !status_is_success(Some(status))) {
         return true;
     }
     match read_mode {
@@ -1329,11 +1551,35 @@ fn failure(
     connect_ms: Option<u64>,
     tls_ms: Option<u64>,
     first_byte_ms: Option<u64>,
+    read: Option<&HttpResponseRead>,
+    baseline: bool,
 ) -> ProbeResult {
+    let read_state = read.copied().unwrap_or(HttpResponseRead {
+        first_byte_ms,
+        ..Default::default()
+    });
+    let uses_tls = matches!(
+        task.protocol,
+        ProbeProtocol::Tls12Http11 | ProbeProtocol::Tls13Http11
+    );
+    let response_started = read_state.first_byte_ms.is_some() || read_state.total_bytes > 0;
+    let transfer_level = compute_transfer_level(
+        connect_ms,
+        tls_ms,
+        &read_state,
+        task.request.verify_transfer_bytes,
+        uses_tls,
+    );
+    let dpi_suspicious = compute_dpi_suspicious(
+        response_started,
+        read_state.total_bytes,
+        task.request.dpi_detection_bytes,
+        outcome,
+    );
     ProbeResult {
         strategy_id: task.strategy_id.clone(),
         worker_id: task.worker_id,
-        qnum: Some(qnum),
+        qnum: if baseline { None } else { Some(qnum) },
         assigned_source_port: Some(source_port),
         target_host: task.target_host.clone(),
         target_ip: task.target_ip,
@@ -1345,13 +1591,16 @@ fn failure(
         setup_ms: None,
         connect_ms,
         tls_ms,
-        first_byte_ms,
+        first_byte_ms: read_state.first_byte_ms.or(first_byte_ms),
         total_ms: total_start.elapsed().as_millis() as u64,
         outcome,
-        http_status: None,
-        bytes_read: 0,
-        header_bytes: 0,
-        body_bytes: 0,
+        http_status: read_state.status,
+        bytes_read: read_state.total_bytes,
+        header_bytes: read_state.header_bytes,
+        body_bytes: read_state.body_bytes,
+        total_bytes: read_state.total_bytes,
+        transfer_level,
+        dpi_suspicious,
         failure_kind: Some(kind),
         error_class: Some(cls),
         error_message: Some(msg.into()),

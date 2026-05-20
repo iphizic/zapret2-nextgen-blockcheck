@@ -1,5 +1,7 @@
 use std::net::IpAddr;
-use zapret_checker::firewall::*;
+use zapret_checker::{
+    config::IsolationConfig, firewall::*, isolation::generate_assignments, worker::WorkerAssignment,
+};
 
 #[test]
 fn nft_ipv4_rule_uses_exact_sport() {
@@ -86,4 +88,49 @@ table inet zapret_checker {
 }
 "#;
     assert_eq!(find_nft_rule_handle(output, &rule), Some(17));
+}
+
+#[test]
+fn nft_vmap_setup_contains_meta_and_ct_mark_maps() {
+    let assignments = generate_assignments(
+        2,
+        &IsolationConfig {
+            mode: "fwmark".to_string(),
+            queue_base: 200,
+            mark_base: "0x20000000".to_string(),
+            desync_mark: "0x40000000".to_string(),
+            use_nft_vmap: true,
+        },
+    );
+    let fw = NftablesVmapFirewallManager {
+        table: "zapret_checker".into(),
+        hook: FirewallHook::Output,
+        priority: "mangle".into(),
+        cleanup_on_start: false,
+        desync_mark: 0x40000000,
+        assignments,
+    };
+    let script = fw.render_setup_script();
+    assert!(script.contains("meta mark vmap @meta_mark_queue"));
+    assert!(script.contains("ct mark vmap @ct_mark_queue"));
+    assert!(script.contains("queue num 200 bypass"));
+    assert!(script.contains("queue num 201 bypass"));
+    assert!(script.contains("0x40000000 notrack"));
+}
+
+#[test]
+fn source_port_assignments_have_no_fwmark() {
+    let assignments = generate_assignments(
+        2,
+        &IsolationConfig {
+            mode: "source_port".to_string(),
+            queue_base: 200,
+            mark_base: "0x20000000".to_string(),
+            desync_mark: "0x40000000".to_string(),
+            use_nft_vmap: false,
+        },
+    );
+    assert!(assignments
+        .iter()
+        .all(|item: &WorkerAssignment| item.fwmark.is_none()));
 }

@@ -1,22 +1,23 @@
 use crate::{
     bayes::BayesianState,
+    config::{IsolationConfig, WorkersConfig},
     graph::{StrategyGraph, StrategyNode},
-    pruning::{should_update_strategy_score, PruningPolicy, PruningState},
+    isolation::generate_assignments,
+    pruning::should_update_strategy_score,
     scoring::{adaptive_score, ScoreWeights},
     types::*,
     worker::WorkerRuntime,
+    worker_pool::{IndexedPoolResult, IndexedPoolTask, WorkerPool, WorkerPoolConfig},
 };
-use futures::{stream, StreamExt};
 use serde::Serialize;
-use std::{net::IpAddr, sync::Arc};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 pub struct Scheduler {
     pub runtime: WorkerRuntime,
-    pub workers_count: usize,
+    pub workers_config: WorkersConfig,
+    pub isolation: IsolationConfig,
     pub successful_strategy_limit: usize,
-    pub pruning_policy: PruningPolicy,
     pub score_weights: ScoreWeights,
     pub targets: Vec<StrategyProbeTarget>,
     pub live_log: bool,
@@ -28,6 +29,8 @@ pub struct StrategyRunResult {
     pub result: ProbeResult,
     pub attempts: Vec<ProbeResult>,
     pub adaptive_score: f64,
+    pub worker_id: usize,
+    pub qnum: u16,
 }
 
 impl Scheduler {
@@ -49,82 +52,95 @@ impl Scheduler {
         cancel: CancellationToken,
         bayes: &mut BayesianState,
     ) -> Vec<StrategyRunResult> {
-        let runtime = Arc::new(self.runtime.clone());
-        let mut pruning = PruningState::default();
         let ordered = self.order_nodes(&graph, bayes);
-        let mut next_worker_id = 0usize;
-        let mut remaining = ordered.into_iter();
-        let mut out = Vec::new();
-        let mut successful_count = 0usize;
+        let worker_count = self.workers_config.count.max(1);
+        let assignments = generate_assignments(worker_count, &self.isolation);
+        let mut runtime = self.runtime.clone();
+        runtime.nfqws_start_grace_ms = self.workers_config.spawn_grace_ms;
 
-        loop {
-            if cancel.is_cancelled() {
-                break;
-            }
-            if self.successful_strategy_limit > 0
-                && successful_count >= self.successful_strategy_limit
-            {
-                break;
-            }
-            let mut batch = Vec::new();
-            while batch.len() < self.workers_count {
-                let Some(node) = remaining.next() else { break };
-                if pruning.is_pruned(&node.family) {
-                    continue;
-                }
-                let worker_id = next_worker_id;
-                next_worker_id += 1;
-                batch.push((worker_id, node));
-            }
-            if batch.is_empty() {
-                break;
-            }
+        let pool = WorkerPool::new(
+            WorkerPoolConfig {
+                workers: self.workers_config.clone(),
+                isolation: self.isolation.clone(),
+                stop_at_success: self.successful_strategy_limit,
+            },
+            runtime,
+            assignments,
+        );
 
-            let results = stream::iter(batch)
-                .map(|(worker_id, node)| {
-                    let runtime = runtime.clone();
-                    let token = cancel.clone();
-                    let targets = self.targets.clone();
-                    let timeouts = timeouts.clone();
+        let targets = self.targets.clone();
+        let timeouts_for_pool = timeouts.clone();
+        let mut strategy_index = 0usize;
+        let mut ordered_nodes = ordered.into_iter();
+        let live_log = self.live_log;
+        let score_weights = self.score_weights;
+        let mut live_index = 0usize;
+
+        let pool_results = pool
+            .run(
+                cancel.clone(),
+                move |ctx| {
+                    let targets = targets.clone();
+                    let timeouts = timeouts_for_pool.clone();
                     async move {
-                        let (result, attempts) = run_strategy_tests(
-                            runtime,
-                            node.clone(),
-                            worker_id,
-                            targets,
-                            timeouts,
-                            token,
-                        )
-                        .await;
-                        (node, result, attempts)
+                        while let Some(node) = ordered_nodes.next() {
+                            if ctx.should_stop() {
+                                break;
+                            }
+                            let task = IndexedPoolTask {
+                                strategy_index,
+                                node,
+                                targets: targets.clone(),
+                                timeouts: timeouts.clone(),
+                            };
+                            strategy_index += 1;
+                            if !ctx.enqueue(task).await {
+                                break;
+                            }
+                        }
                     }
-                })
-                .buffer_unordered(self.workers_count)
-                .collect::<Vec<_>>()
-                .await;
+                },
+                move |item| {
+                    if live_log {
+                        live_index += 1;
+                        eprintln!(
+                            "{}",
+                            live_strategy_result_line(live_index, item, score_weights)
+                        );
+                    }
+                },
+            )
+            .await;
 
-            for (node, result, attempts) in results {
-                if result.outcome == ProbeOutcome::Success {
-                    successful_count += 1;
-                }
-                if should_update_strategy_score(&result) {
-                    bayes.update(&node.id, node.prior, &result);
-                }
-                pruning.record(&node.family, &result, &self.pruning_policy);
-                let score = adaptive_score(&result, node.cost, node.risk, self.score_weights);
-                let item = StrategyRunResult {
-                    node,
-                    result,
-                    attempts,
-                    adaptive_score: score,
-                };
-                if self.live_log {
-                    eprintln!("{}", live_strategy_line(out.len() + 1, &item));
-                }
-                out.push(item);
+        self.finalize_results(pool_results, bayes)
+    }
+
+    fn finalize_results(
+        &self,
+        pool_results: Vec<IndexedPoolResult>,
+        bayes: &mut BayesianState,
+    ) -> Vec<StrategyRunResult> {
+        let mut out = Vec::with_capacity(pool_results.len());
+        for item in pool_results {
+            if should_update_strategy_score(&item.result) {
+                bayes.update(&item.node.id, item.node.prior, &item.result);
             }
+            let score = adaptive_score(
+                &item.result,
+                item.node.cost,
+                item.node.risk,
+                self.score_weights,
+            );
+            let run = StrategyRunResult {
+                node: item.node,
+                result: item.result,
+                attempts: item.attempts,
+                adaptive_score: score,
+                worker_id: item.worker_id,
+                qnum: item.qnum,
+            };
+            out.push(run);
         }
-
         out
     }
 
@@ -132,15 +148,12 @@ impl Scheduler {
     pub async fn run_plan(
         &self,
         host: String,
-        ip: IpAddr,
+        ip: std::net::IpAddr,
         nodes: Vec<StrategyNode>,
         request: HttpRequestSpec,
         timeouts: ProbeTimeouts,
     ) -> Vec<ProbeResult> {
-        let graph = StrategyGraph {
-            nodes,
-            transition_cost: Default::default(),
-        };
+        let graph = StrategyGraph { nodes };
         let _ = (host, ip, request);
         self.run_graph(graph, timeouts, CancellationToken::new())
             .await
@@ -155,49 +168,18 @@ impl Scheduler {
     }
 }
 
-async fn run_strategy_tests(
-    runtime: Arc<WorkerRuntime>,
-    node: StrategyNode,
-    worker_id: usize,
-    targets: Vec<StrategyProbeTarget>,
-    timeouts: ProbeTimeouts,
-    token: CancellationToken,
-) -> (ProbeResult, Vec<ProbeResult>) {
-    let mut attempts = Vec::new();
-    let mut last_result = None;
-
-    for target in targets {
-        let task = StrategyTask {
-            strategy_id: node.id.clone(),
-            strategy_args: node.args.clone(),
-            target_host: target.host,
-            target_ip: target.ip,
-            target_port: target.port,
-            protocol: target.protocol,
-            path: target.request.path_and_query.clone(),
-            request: target.request,
-            timeouts: timeouts.clone(),
-        };
-        let result = runtime
-            .run_strategy_task(task, worker_id, Some(token.clone()))
-            .await;
-        let success = result.outcome == ProbeOutcome::Success;
-        last_result = Some(result.clone());
-        attempts.push(result);
-        if !success {
-            return (attempts.last().expect("attempt exists").clone(), attempts);
-        }
-    }
-
-    let result = last_result.expect("at least one strategy target is required");
-    (result, attempts)
-}
-
-fn live_strategy_line(index: usize, item: &StrategyRunResult) -> String {
+fn live_strategy_result_line(
+    index: usize,
+    item: &IndexedPoolResult,
+    weights: ScoreWeights,
+) -> String {
+    let score = adaptive_score(&item.result, item.node.cost, item.node.risk, weights);
     format!(
-        "live: strategy #{index} {} family={} tests={}/{} domains={} outcome={:?} http={} body={}B bytes={} tls={}ms total={}ms score={:.1}",
+        "info(checker): strategy #{index:<5} id={} family={} worker={} qnum={} attempts={}/{} domains={} outcome={:?} http={} body={}B bytes={} tls={}ms total={}ms score={:.1}",
         item.node.id,
         item.node.family,
+        item.worker_id,
+        item.qnum,
         item.attempts
             .iter()
             .filter(|attempt| attempt.outcome == ProbeOutcome::Success)
@@ -216,7 +198,7 @@ fn live_strategy_line(index: usize, item: &StrategyRunResult) -> String {
             .map(|v| v.to_string())
             .unwrap_or_else(|| "-".into()),
         item.result.total_ms,
-        item.adaptive_score,
+        score,
     )
 }
 

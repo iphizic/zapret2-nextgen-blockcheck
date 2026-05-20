@@ -1,3 +1,4 @@
+use crate::worker::WorkerAssignment;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::{net::IpAddr, process::Stdio};
@@ -253,6 +254,153 @@ impl FirewallManager for NftablesFirewallManager {
         };
         self.nft(&self.render_delete_rule_by_handle(&rule, handle))
             .await
+    }
+
+    async fn cleanup_all(&self) -> Result<(), FirewallError> {
+        let args = vec![
+            "delete".into(),
+            "table".into(),
+            "inet".into(),
+            self.table.clone(),
+        ];
+        let _ = self.nft_quiet(&args).await;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NftablesVmapFirewallManager {
+    pub table: String,
+    pub hook: FirewallHook,
+    pub priority: String,
+    pub cleanup_on_start: bool,
+    pub desync_mark: u32,
+    pub assignments: Vec<WorkerAssignment>,
+}
+
+impl NftablesVmapFirewallManager {
+    pub fn render_setup_script(&self) -> String {
+        let chain = match self.hook {
+            FirewallHook::Output => "output",
+            FirewallHook::Postrouting => "postrouting",
+        };
+        let meta_elements = self
+            .assignments
+            .iter()
+            .filter_map(|assignment| {
+                assignment.fwmark.map(|mark| {
+                    format!(
+                        "            {mark:#x} : queue num {} bypass,",
+                        assignment.qnum
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let ct_elements = meta_elements.clone();
+
+        format!(
+            r#"table inet {table} {{
+    map meta_mark_queue {{
+        type mark : meta mark;
+        elements = {{
+{meta_elements}
+        }};
+    }}
+
+    map ct_mark_queue {{
+        type mark : meta mark;
+        elements = {{
+{ct_elements}
+        }};
+    }}
+
+    chain {chain} {{
+        type filter hook {chain} priority {priority}; policy accept;
+        meta mark {desync_mark:#x} notrack counter accept comment "desync bypass";
+        meta mark vmap @meta_mark_queue
+        ct mark set meta mark
+        ct mark vmap @ct_mark_queue
+    }}
+
+    chain input {{
+        type filter hook input priority {priority}; policy accept;
+        ct mark vmap @ct_mark_queue
+    }}
+}}"#,
+            table = self.table,
+            meta_elements = meta_elements,
+            ct_elements = ct_elements,
+            chain = chain,
+            priority = self.priority,
+            desync_mark = self.desync_mark,
+        )
+    }
+
+    async fn nft_apply_script(&self, script: &str) -> Result<(), FirewallError> {
+        use tokio::io::AsyncWriteExt;
+        let mut child = Command::new("nft")
+            .arg("-f")
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(script.as_bytes()).await?;
+        }
+        let output = child.wait_with_output().await?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(FirewallError::CommandFailed(format!(
+                "nft script failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )))
+        }
+    }
+
+    async fn nft_quiet(&self, args: &[String]) -> Result<(), FirewallError> {
+        let status = Command::new("nft")
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(FirewallError::CommandFailed(format!(
+                "nft {:?} -> {}",
+                args, status
+            )))
+        }
+    }
+}
+
+#[async_trait]
+impl FirewallManager for NftablesVmapFirewallManager {
+    async fn setup(&self) -> Result<(), FirewallError> {
+        if self.cleanup_on_start {
+            let _ = self
+                .nft_quiet(&[
+                    "delete".into(),
+                    "table".into(),
+                    "inet".into(),
+                    self.table.clone(),
+                ])
+                .await;
+        }
+        self.nft_apply_script(&self.render_setup_script()).await
+    }
+
+    async fn install_worker_rule(&self, _rule: WorkerFirewallRule) -> Result<(), FirewallError> {
+        Ok(())
+    }
+
+    async fn remove_worker_rule(&self, _rule: WorkerFirewallRule) -> Result<(), FirewallError> {
+        Ok(())
     }
 
     async fn cleanup_all(&self) -> Result<(), FirewallError> {

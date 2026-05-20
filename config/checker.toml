@@ -1,30 +1,39 @@
 [workers]
 count = 64
-
-[queue]
-base_qnum = 10
-qnum_count = 164
+spawn_grace_ms = 100
+task_channel_size = 1024
+result_channel_size = 1024
+shutdown_timeout_ms = 3000
 
 [source_port]
 mode = "os_assigned"
 bind_ipv4 = "0.0.0.0"
 bind_ipv6 = "::"
 
+[isolation]
+mode = "source_port"
+queue_base = 10
+mark_base = "0x20000000"
+desync_mark = "0x40000000"
+use_nft_vmap = false
+
 [probe]
 backend = "native"
 connect_timeout_ms = 3000
 tls_timeout_ms = 3000
 first_byte_timeout_ms = 5000
-total_timeout_ms = 10000
+total_timeout_ms = 1000
 max_read_bytes = 65536
 user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:150.0) Gecko/20100101 Firefox/150.0"
 method = "GET"
 read_mode = "body"
 min_body_bytes = 32000
+dpi_detection_bytes = 16384
+verify_transfer_bytes = 32768
 test_count = 5
 base_domains = [
   "youtube.com",
-  "istio.io",
+  "istio.io/latest/logos/rappi.png",
 ]
 
 [probe.protocols]
@@ -33,6 +42,17 @@ tls12 = true
 tls13 = false
 quic = true
 preferred = "tls12"
+
+[probe.dns]
+mode = "doh"
+doh_addr = "1.1.1.1:443"
+doh_addrs = [
+  "1.1.1.1:443",
+  "104.16.248.249:443",
+  "104.16.249.249:443",
+]
+doh_host = "cloudflare-dns.com"
+doh_path = "/dns-query"
 
 [nfqws]
 binary = "/opt/zapret2/binaries/linux-arm64/nfqws2"
@@ -62,15 +82,128 @@ enable_curl_fallback = false
 keep_rules_on_failure = false
 verbose_nfqws = false
 
+[payloads]
+max_per_protocol = 16
+
+[payloads.http]
+builtin = ["fake_default_http"]
+files = []
+
+[payloads.http.aliases]
+http_iana_org = "http_iana_org.bin"
+
+[payloads.tls]
+builtin = ["fake_default_tls"]
+files = []
+
+[payloads.tls.aliases]
+tls_gosuslugi_ru = "tls_clienthello_gosuslugi_ru.bin"
+tls_iana_org = "tls_clienthello_iana_org.bin"
+tls_rutracker_org_kyber = "tls_clienthello_rutracker_org_kyber.bin"
+tls_sberbank_ru = "tls_clienthello_sberbank_ru.bin"
+tls_vk_com = "tls_clienthello_vk_com.bin"
+tls_vk_com_kyber = "tls_clienthello_vk_com_kyber.bin"
+tls_www_google_com = "tls_clienthello_www_google_com.bin"
+
+[payloads.quic]
+builtin = ["fake_default_quic"]
+files = []
+
+[payloads.quic.aliases]
+quic_facebook_com = "quic_initial_facebook_com.bin"
+quic_facebook_com_quiche = "quic_initial_facebook_com_quiche.bin"
+quic_googlevideo_rr1_kyber_1 = "quic_initial_rr1---sn-xguxaxjvh-n8me_googlevideo_com_kyber_1.bin"
+quic_googlevideo_rr1_kyber_2 = "quic_initial_rr1---sn-xguxaxjvh-n8me_googlevideo_com_kyber_2.bin"
+quic_googlevideo_rr2 = "quic_initial_rr2---sn-gvnuxaxjvh-o8ge_googlevideo_com.bin"
+quic_rutracker_org = "quic_initial_rutracker_org.bin"
+quic_rutracker_org_kyber_1 = "quic_initial_rutracker_org_kyber_1.bin"
+quic_rutracker_org_kyber_2 = "quic_initial_rutracker_org_kyber_2.bin"
+quic_short_header = "quic_short_header.bin"
+quic_vk_com = "quic_initial_vk_com.bin"
+quic_www_google_com = "quic_initial_www_google_com.bin"
+
+[blobs]
+auto_load = true
+base_dir = "/opt/zapret/files/fake"
+
+[strategy_values]
+mode = "extend"
+
+[strategy_values.http]
+payload = ["http_request"]
+pattern = ["zero", "random"]
+fooling = ["badsum", "autottl"]
+
+[strategy_values.tls]
+payload = ["tls_client_hello"]
+pattern = ["zero", "random"]
+seqovl_pattern = ["zero", "random"]
+fooling = ["badsum", "autottl"]
+tls_mod = ["none", "random_sni", "random_session_id"]
+
+[strategy_values.quic]
+payload = ["quic_initial"]
+pattern = ["zero", "random"]
+fooling = ["badsum", "autottl"]
+
+[strategy_combinations]
+enabled = true
+require_different_family = true
+allow_same_action = false
+mode = "pairwise"
+
+[[strategy_combinations.allowed]]
+protocols = ["tls12", "tls13"]
+families = ["fake", "split"]
+
+[[strategy_combinations.allowed]]
+protocols = ["tls12", "tls13"]
+families = ["fake", "disorder"]
+
+[[strategy_combinations.allowed]]
+protocols = ["tls12", "tls13"]
+families = ["fake", "faked_split"]
+
+[[strategy_combinations.allowed]]
+protocols = ["tls12", "tls13"]
+families = ["fake", "seqovl"]
+
+[[strategy_combinations.allowed]]
+protocols = ["tls12", "tls13"]
+families = ["syndata", "split"]
+
+[[strategy_combinations.allowed]]
+protocols = ["tls12", "tls13"]
+families = ["ipfrag", "fake"]
+
+[[strategy_combinations.allowed]]
+protocols = ["tls12", "tls13"]
+families = ["wsize", "split"]
+
+[[strategy_combinations.allowed]]
+protocols = ["http"]
+families = ["http_trick", "split"]
+
+[[strategy_combinations.allowed]]
+protocols = ["http"]
+families = ["fake", "split"]
+
+[[strategy_combinations.allowed]]
+protocols = ["quic"]
+families = ["fake", "udp_len"]
+
+[[strategy_combinations.allowed]]
+protocols = ["quic"]
+families = ["fake", "ipfrag"]
+
+[[strategy_combinations.allowed]]
+protocols = ["quic"]
+families = ["udp_len", "ipfrag"]
+
 [strategies]
 file = "config/standart/strategies.yaml"
-transition_matrix = "config/standart/transition_matrix.yaml"
-soft_fail_family_limit = 6
-successful_strategy_limit = 80
+successful_strategy_limit = 10
 search_mode = "expand"
-max_candidates = 1000
-max_per_family = 64
-max_per_action = 20
 round_robin_families = true
 
 [bayes]

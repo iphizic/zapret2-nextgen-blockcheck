@@ -27,6 +27,8 @@ fn request(path: &str) -> HttpRequestSpec {
         user_agent: "zapret-checker".into(),
         read_mode: ReadMode::Body,
         min_body_bytes: 1,
+        dpi_detection_bytes: 16384,
+        verify_transfer_bytes: 32768,
         max_read_bytes: 1024,
     }
 }

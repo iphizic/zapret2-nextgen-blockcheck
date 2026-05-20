@@ -1,5 +1,9 @@
+use crate::{
+    config::{StrategyCombinationConfig, StrategyValuesConfig},
+    payload_registry::PayloadAliases,
+};
 use serde::{Deserialize, Serialize};
-use serde_yaml::{Mapping, Value};
+use serde_yaml::Value;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap, HashSet},
@@ -16,9 +20,20 @@ pub struct StrategyNode {
     #[serde(default = "default_action_id")]
     pub action_id: String,
     pub args: Vec<String>,
+    #[serde(default, rename = "strategy_components")]
+    pub components: Vec<StrategyComponent>,
+    #[serde(default)]
+    pub is_combined: bool,
     pub cost: f64,
     pub risk: f64,
     pub prior: (f64, f64),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StrategyComponent {
+    pub family: String,
+    pub action_id: String,
+    pub args: Vec<String>,
 }
 
 fn default_action_id() -> String {
@@ -28,8 +43,19 @@ fn default_action_id() -> String {
 #[derive(Debug, Clone, Default)]
 pub struct StrategyGraph {
     pub nodes: Vec<StrategyNode>,
-    #[allow(dead_code)]
-    pub transition_cost: HashMap<(String, String), f64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct GraphLoadOptions<'a> {
+    pub protocol_key: &'a str,
+    pub search_mode: &'a str,
+    pub max_candidates: usize,
+    pub max_per_family: usize,
+    pub max_per_action: usize,
+    pub round_robin_families: bool,
+    pub payload_aliases: Option<&'a PayloadAliases>,
+    pub strategy_values: Option<&'a StrategyValuesConfig>,
+    pub strategy_combinations: Option<&'a StrategyCombinationConfig>,
 }
 
 impl StrategyGraph {
@@ -38,91 +64,86 @@ impl StrategyGraph {
     }
 
     #[allow(dead_code)]
-    pub fn load_for_protocol(
-        strategies_path: &Path,
-        transition_path: &Path,
-        protocol_key: &str,
-    ) -> anyhow::Result<Self> {
+    pub fn load_for_protocol(strategies_path: &Path, protocol_key: &str) -> anyhow::Result<Self> {
         Self::load_for_protocol_mode(
             strategies_path,
-            transition_path,
-            protocol_key,
-            "signal",
-            default_max_candidates(),
-            default_max_per_family(),
-            default_max_per_action(),
-            default_round_robin_families(),
+            GraphLoadOptions {
+                protocol_key,
+                search_mode: "signal",
+                max_candidates: no_strategy_limit(),
+                max_per_family: no_strategy_limit(),
+                max_per_action: no_strategy_limit(),
+                round_robin_families: default_round_robin_families(),
+                payload_aliases: None,
+                strategy_values: None,
+                strategy_combinations: None,
+            },
         )
     }
 
     pub fn load_for_protocol_mode(
         strategies_path: &Path,
-        transition_path: &Path,
-        protocol_key: &str,
-        search_mode: &str,
-        max_candidates: usize,
-        max_per_family: usize,
-        max_per_action: usize,
-        round_robin_families: bool,
+        options: GraphLoadOptions<'_>,
     ) -> anyhow::Result<Self> {
         let strategies_text = std::fs::read_to_string(strategies_path)?;
         let strategies_yaml: Value = serde_yaml::from_str(&strategies_text)?;
 
-        let nodes = if let Some(strategies) = value_seq(&strategies_yaml, "strategies") {
+        let mut nodes = if let Some(strategies) = value_seq(&strategies_yaml, "strategies") {
             select_diverse_nodes(
                 parse_simple_strategies(strategies)?,
-                protocol_key,
-                max_candidates,
-                max_per_family,
-                max_per_action,
-                round_robin_families,
+                options.protocol_key,
+                options.max_candidates,
+                options.max_per_family,
+                options.max_per_action,
+                options.round_robin_families,
             )
         } else {
             parse_catalog_strategies(
                 &strategies_yaml,
-                protocol_key,
-                search_mode,
-                max_candidates,
-                max_per_family,
-                max_per_action,
-                round_robin_families,
+                options.protocol_key,
+                options.search_mode,
+                options.max_candidates,
+                options.max_per_family,
+                options.max_per_action,
+                options.round_robin_families,
+                options.payload_aliases,
+                options.strategy_values,
             )?
         };
+        if let Some(strategy_combinations) = options.strategy_combinations {
+            let remaining = options.max_candidates.saturating_sub(nodes.len());
+            if remaining > 0 {
+                let mut combined =
+                    generate_combined_nodes(options.protocol_key, &nodes, strategy_combinations);
+                combined.truncate(remaining);
+                nodes.extend(combined);
+            }
+        }
 
-        let transition_text = std::fs::read_to_string(transition_path)?;
-        let transition_cost = parse_transition_costs(&transition_text)?;
-
-        Ok(Self {
-            nodes,
-            transition_cost,
-        })
+        Ok(Self { nodes })
     }
 
     #[allow(dead_code)]
-    pub fn load(strategies_path: &Path, transition_path: &Path) -> anyhow::Result<Self> {
+    pub fn load(strategies_path: &Path) -> anyhow::Result<Self> {
         Self::load_for_protocol_mode(
             strategies_path,
-            transition_path,
-            "tls13",
-            "signal",
-            default_max_candidates(),
-            default_max_per_family(),
-            default_max_per_action(),
-            default_round_robin_families(),
+            GraphLoadOptions {
+                protocol_key: "tls13",
+                search_mode: "signal",
+                max_candidates: no_strategy_limit(),
+                max_per_family: no_strategy_limit(),
+                max_per_action: no_strategy_limit(),
+                round_robin_families: default_round_robin_families(),
+                payload_aliases: None,
+                strategy_values: None,
+                strategy_combinations: None,
+            },
         )
     }
 }
 
-fn default_max_candidates() -> usize {
-    200
-}
-
-fn default_max_per_family() -> usize {
-    24
-}
-
-fn default_max_per_action() -> usize {
-    8
+pub fn no_strategy_limit() -> usize {
+    usize::MAX
 }
 
 fn default_round_robin_families() -> bool {
@@ -140,31 +161,9 @@ fn parse_simple_strategies(strategies: &[Value]) -> anyhow::Result<Vec<StrategyN
         if node.action_id.is_empty() || node.action_id == "manual" {
             node.action_id = node.family.clone();
         }
+        normalize_single_node(node);
     }
     Ok(nodes)
-}
-
-fn parse_transition_costs(text: &str) -> anyhow::Result<HashMap<(String, String), f64>> {
-    let value: Value = serde_yaml::from_str(text)?;
-    let rows = value_mapping(&value, "costs")
-        .or_else(|| value_mapping(&value, "families"))
-        .ok_or_else(|| anyhow::anyhow!("transition matrix missing costs/families mapping"))?;
-    let mut out = HashMap::new();
-    for (from, row) in rows {
-        let Some(from) = from.as_str() else {
-            continue;
-        };
-        let Some(row) = row.as_mapping() else {
-            continue;
-        };
-        for (to, cost) in row {
-            let (Some(to), Some(cost)) = (to.as_str(), cost.as_f64()) else {
-                continue;
-            };
-            out.insert((from.to_string(), to.to_string()), cost);
-        }
-    }
-    Ok(out)
 }
 
 fn parse_catalog_strategies(
@@ -175,6 +174,8 @@ fn parse_catalog_strategies(
     max_per_family: usize,
     max_per_action: usize,
     round_robin_families: bool,
+    runtime_payload_aliases: Option<&PayloadAliases>,
+    runtime_strategy_values: Option<&StrategyValuesConfig>,
 ) -> anyhow::Result<Vec<StrategyNode>> {
     let families = value_seq(root, "families")
         .ok_or_else(|| anyhow::anyhow!("strategy catalog missing strategies/families"))?;
@@ -209,6 +210,8 @@ fn parse_catalog_strategies(
                     family_id,
                     Some(candidate),
                     false,
+                    runtime_payload_aliases,
+                    runtime_strategy_values,
                     &mut nodes,
                     &mut seen,
                 );
@@ -234,6 +237,8 @@ fn parse_catalog_strategies(
                     family_id,
                     None,
                     true,
+                    runtime_payload_aliases,
+                    runtime_strategy_values,
                     &mut nodes,
                     &mut seen,
                 );
@@ -248,6 +253,8 @@ fn parse_catalog_strategies(
                     family_id,
                     None,
                     true,
+                    runtime_payload_aliases,
+                    runtime_strategy_values,
                     &mut nodes,
                     &mut seen,
                 );
@@ -349,6 +356,8 @@ fn append_family_actions(
     family_id: &str,
     candidate: Option<&Value>,
     use_action_values: bool,
+    runtime_payload_aliases: Option<&PayloadAliases>,
+    runtime_strategy_values: Option<&StrategyValuesConfig>,
     nodes: &mut Vec<StrategyNode>,
     seen: &mut HashSet<String>,
 ) {
@@ -366,6 +375,9 @@ fn append_family_actions(
     let overrides = candidate.and_then(|v| v.get("params"));
 
     for action in &family.actions {
+        if action.id.contains("_legacy") {
+            continue;
+        }
         if action_filter
             .as_ref()
             .is_some_and(|ids| !ids.contains(action.id.as_str()))
@@ -375,7 +387,15 @@ fn append_family_actions(
         if !protocol_matches(&action.protocols, protocol_key, &action.template) {
             continue;
         }
-        for lua in render_lua_desync_variants(root, action, overrides, use_action_values) {
+        for lua in render_lua_desync_variants(
+            root,
+            protocol_key,
+            action,
+            overrides,
+            use_action_values,
+            runtime_payload_aliases,
+            runtime_strategy_values,
+        ) {
             let mut args = vec![format!("--lua-desync={lua}")];
             apply_blob_file_options(&mut args);
             ensure_payload_option(&mut args, Some(protocol_key));
@@ -387,6 +407,12 @@ fn append_family_actions(
                 id: format!("{protocol_key}_{}_{}_{}", family.id, action.id, nodes.len()),
                 family: family.id.clone(),
                 action_id: action.id.clone(),
+                components: vec![StrategyComponent {
+                    family: family.id.clone(),
+                    action_id: action.id.clone(),
+                    args: args.clone(),
+                }],
+                is_combined: false,
                 args,
                 cost: family.cost,
                 risk: family.risk,
@@ -404,6 +430,8 @@ pub fn select_diverse_nodes(
     max_per_action: usize,
     round_robin_families: bool,
 ) -> Vec<StrategyNode> {
+    let mut nodes = nodes;
+    nodes.sort_by(compare_node_quality);
     let mut seen_args = HashSet::new();
     let mut per_family = HashMap::<String, usize>::new();
     let mut per_action = HashMap::<(String, String), usize>::new();
@@ -438,6 +466,90 @@ pub fn select_diverse_nodes(
     };
 
     reindex_nodes(protocol_key, selected)
+}
+
+pub fn generate_combined_nodes(
+    protocol_key: &str,
+    base_nodes: &[StrategyNode],
+    cfg: &StrategyCombinationConfig,
+) -> Vec<StrategyNode> {
+    if !cfg.enabled {
+        return Vec::new();
+    }
+
+    let mut singles = base_nodes
+        .iter()
+        .filter(|node| !node.is_combined)
+        .filter(|node| !node.action_id.contains("_legacy"))
+        .cloned()
+        .collect::<Vec<_>>();
+    for node in &mut singles {
+        normalize_single_node(node);
+    }
+    singles.sort_by(compare_combination_input);
+
+    let mut out = Vec::new();
+    let mut seen_args = HashSet::new();
+
+    for i in 0..singles.len() {
+        for j in (i + 1)..singles.len() {
+            let (first, second) = ordered_components(&singles[i], &singles[j]);
+            if first.id == second.id {
+                continue;
+            }
+            if cfg.require_different_family && first.family == second.family {
+                continue;
+            }
+            if !cfg.allow_same_action && first.action_id == second.action_id {
+                continue;
+            }
+            if args_intersect(&first.args, &second.args) {
+                continue;
+            }
+            if cfg.mode != "force" && !cfg.pair_allowed(protocol_key, &first.family, &second.family)
+            {
+                continue;
+            }
+
+            let mut args = first.args.clone();
+            args.extend(second.args.clone());
+            if !seen_args.insert(args.join("\0")) {
+                continue;
+            }
+
+            let family = format!("combined_{}_{}", first.family, second.family);
+            let action_id = format!("{}+{}", first.action_id, second.action_id);
+            out.push(StrategyNode {
+                id: format!(
+                    "{protocol_key}_combined_{}_{}_{}",
+                    first.family,
+                    second.family,
+                    out.len()
+                ),
+                family,
+                action_id,
+                components: vec![
+                    StrategyComponent {
+                        family: first.family.clone(),
+                        action_id: first.action_id.clone(),
+                        args: first.args.clone(),
+                    },
+                    StrategyComponent {
+                        family: second.family.clone(),
+                        action_id: second.action_id.clone(),
+                        args: second.args.clone(),
+                    },
+                ],
+                is_combined: true,
+                args,
+                cost: first.cost + second.cost + 3.0,
+                risk: first.risk.max(second.risk) + 0.1 * first.risk.min(second.risk),
+                prior: (1.0, 1.0),
+            });
+        }
+    }
+
+    out
 }
 
 fn round_robin_by_family(nodes: Vec<StrategyNode>, max_candidates: usize) -> Vec<StrategyNode> {
@@ -494,10 +606,10 @@ pub fn prior_success_ratio(node: &StrategyNode) -> f64 {
 }
 
 pub fn compare_node_quality(a: &StrategyNode, b: &StrategyNode) -> Ordering {
-    a.cost
-        .total_cmp(&b.cost)
-        .then_with(|| a.risk.total_cmp(&b.risk))
-        .then_with(|| prior_success_ratio(b).total_cmp(&prior_success_ratio(a)))
+    family_diversity_rank(&a.family)
+        .cmp(&family_diversity_rank(&b.family))
+        .then_with(|| a.family.cmp(&b.family))
+        .then_with(|| a.action_id.cmp(&b.action_id))
         .then_with(|| a.id.cmp(&b.id))
 }
 
@@ -526,9 +638,65 @@ fn reindex_nodes(protocol_key: &str, nodes: Vec<StrategyNode>) -> Vec<StrategyNo
         .enumerate()
         .map(|(i, mut node)| {
             node.id = format!("{}_{}_{}_{}", protocol_key, node.family, node.action_id, i);
+            if node.is_combined {
+                node.id = format!("{}_{}_{}", protocol_key, node.family, i);
+            } else {
+                normalize_single_node(&mut node);
+            }
             node
         })
         .collect()
+}
+
+fn normalize_single_node(node: &mut StrategyNode) {
+    if node.is_combined || !node.components.is_empty() {
+        return;
+    }
+    node.components = vec![StrategyComponent {
+        family: node.family.clone(),
+        action_id: node.action_id.clone(),
+        args: node.args.clone(),
+    }];
+}
+
+fn compare_combination_input(a: &StrategyNode, b: &StrategyNode) -> Ordering {
+    combination_family_rank(&a.family)
+        .cmp(&combination_family_rank(&b.family))
+        .then_with(|| a.family.cmp(&b.family))
+        .then_with(|| a.action_id.cmp(&b.action_id))
+        .then_with(|| a.id.cmp(&b.id))
+}
+
+fn ordered_components<'a>(
+    a: &'a StrategyNode,
+    b: &'a StrategyNode,
+) -> (&'a StrategyNode, &'a StrategyNode) {
+    if compare_combination_input(a, b).is_gt() {
+        (b, a)
+    } else {
+        (a, b)
+    }
+}
+
+fn combination_family_rank(family: &str) -> usize {
+    match family {
+        "fake" => 0,
+        "syndata" => 1,
+        "ipfrag" => 2,
+        "udp_len" => 3,
+        "oob" => 4,
+        "split" => 10,
+        "disorder" => 11,
+        "faked_split" => 12,
+        "seqovl" => 13,
+        "wsize" => 14,
+        _ => 50,
+    }
+}
+
+fn args_intersect(a: &[String], b: &[String]) -> bool {
+    let args = a.iter().collect::<HashSet<_>>();
+    b.iter().any(|arg| args.contains(arg))
 }
 
 fn protocol_matches(protocols: &[String], protocol_key: &str, template: &str) -> bool {
@@ -551,12 +719,22 @@ fn protocol_matches(protocols: &[String], protocol_key: &str, template: &str) ->
 
 fn render_lua_desync_variants(
     root: &Value,
+    protocol_key: &str,
     action: &CatalogAction,
     overrides: Option<&Value>,
     use_action_values: bool,
+    runtime_payload_aliases: Option<&PayloadAliases>,
+    runtime_strategy_values: Option<&StrategyValuesConfig>,
 ) -> Vec<String> {
-    let combinations =
-        param_combinations(root, action.params.as_ref(), overrides, use_action_values);
+    let combinations = param_combinations(
+        root,
+        protocol_key,
+        action.params.as_ref(),
+        overrides,
+        use_action_values,
+        runtime_payload_aliases,
+        runtime_strategy_values,
+    );
     let mut out = Vec::new();
 
     for combo in combinations {
@@ -773,11 +951,22 @@ fn lua_function_uses_standard_payload(function: &str) -> bool {
 
 fn param_combinations(
     root: &Value,
+    protocol_key: &str,
     action_params: Option<&Value>,
     overrides: Option<&Value>,
     use_action_values: bool,
+    runtime_payload_aliases: Option<&PayloadAliases>,
+    runtime_strategy_values: Option<&StrategyValuesConfig>,
 ) -> Vec<Vec<(String, String)>> {
-    let keys_values = merged_param_values(root, action_params, overrides, use_action_values);
+    let keys_values = merged_param_values(
+        root,
+        protocol_key,
+        action_params,
+        overrides,
+        use_action_values,
+        runtime_payload_aliases,
+        runtime_strategy_values,
+    );
     if keys_values.is_empty() {
         return vec![Vec::new()];
     }
@@ -799,9 +988,12 @@ fn param_combinations(
 
 fn merged_param_values(
     root: &Value,
+    protocol_key: &str,
     action_params: Option<&Value>,
     overrides: Option<&Value>,
     use_action_values: bool,
+    runtime_payload_aliases: Option<&PayloadAliases>,
+    runtime_strategy_values: Option<&StrategyValuesConfig>,
 ) -> Vec<(String, Vec<String>)> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -816,7 +1008,15 @@ fn merged_param_values(
                 .and_then(|m| m.get(Value::String(name.to_string())))
                 .map(values_from_yaml)
                 .unwrap_or_else(|| param_values_from_action(root, def, use_action_values));
-            let values = expand_dynamic_param_values(name, values);
+            let mut values = expand_dynamic_param_values(name, values);
+            maybe_extend_payload_values(protocol_key, name, &mut values, runtime_payload_aliases);
+            apply_strategy_values(
+                protocol_key,
+                name,
+                &mut values,
+                runtime_payload_aliases,
+                runtime_strategy_values,
+            );
             if !values.is_empty() {
                 seen.insert(name.to_string());
                 out.push((name.to_string(), values));
@@ -833,7 +1033,15 @@ fn merged_param_values(
                 continue;
             }
             let values = values_from_yaml(value);
-            let values = expand_dynamic_param_values(name, values);
+            let mut values = expand_dynamic_param_values(name, values);
+            maybe_extend_payload_values(protocol_key, name, &mut values, runtime_payload_aliases);
+            apply_strategy_values(
+                protocol_key,
+                name,
+                &mut values,
+                runtime_payload_aliases,
+                runtime_strategy_values,
+            );
             if !values.is_empty() {
                 out.push((name.to_string(), values));
             }
@@ -857,6 +1065,65 @@ fn expand_dynamic_param_values(name: &str, values: Vec<String>) -> Vec<String> {
         }
     }
     dedup_preserve_order(out)
+}
+
+fn maybe_extend_payload_values(
+    protocol_key: &str,
+    param_name: &str,
+    values: &mut Vec<String>,
+    runtime_payload_aliases: Option<&PayloadAliases>,
+) {
+    if param_name != "blob" {
+        return;
+    }
+
+    let Some(aliases) = runtime_payload_aliases else {
+        return;
+    };
+
+    for alias in aliases.for_protocol_key(protocol_key) {
+        if !values.iter().any(|value| value == alias) {
+            values.push(alias.clone());
+        }
+    }
+}
+
+fn apply_strategy_values(
+    protocol_key: &str,
+    param_name: &str,
+    values: &mut Vec<String>,
+    runtime_payload_aliases: Option<&PayloadAliases>,
+    runtime_strategy_values: Option<&StrategyValuesConfig>,
+) {
+    let Some(strategy_values) = runtime_strategy_values else {
+        return;
+    };
+    let Some(config_values) = strategy_values.values_for_param(protocol_key, param_name) else {
+        return;
+    };
+
+    match strategy_values.mode.as_str() {
+        "override" => {
+            values.clear();
+            values.extend(config_values.iter().cloned());
+            if param_name == "blob" {
+                maybe_extend_payload_values(
+                    protocol_key,
+                    param_name,
+                    values,
+                    runtime_payload_aliases,
+                );
+            }
+            *values = dedup_preserve_order(std::mem::take(values));
+        }
+        _ => {
+            for value in config_values {
+                if !values.iter().any(|seen| seen == value) {
+                    values.push(value.clone());
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1044,8 +1311,4 @@ fn string_list(value: Option<&Value>) -> Vec<String> {
 
 fn value_seq<'a>(value: &'a Value, key: &str) -> Option<&'a Vec<Value>> {
     value.get(key).and_then(Value::as_sequence)
-}
-
-fn value_mapping<'a>(value: &'a Value, key: &str) -> Option<&'a Mapping> {
-    value.get(key).and_then(Value::as_mapping)
 }

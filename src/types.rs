@@ -106,7 +106,7 @@ pub fn parse_target_request(
     }
 
     if let Some(host_input) = host {
-        let (host, path_and_query) = split_host_path(&host_input)?;
+        let (host, explicit_port, path_and_query) = split_host_path(&host_input)?;
         let (scheme, port) = match selected_protocol {
             ProbeProtocol::HttpPlain => (TargetScheme::Http, 80),
             ProbeProtocol::Tls12Http11 | ProbeProtocol::Tls13Http11 => (TargetScheme::Https, 443),
@@ -116,7 +116,7 @@ pub fn parse_target_request(
             original: host_input,
             scheme,
             host,
-            port,
+            port: explicit_port.unwrap_or(port),
             path_and_query,
             protocol: selected_protocol,
         });
@@ -166,9 +166,10 @@ pub fn parse_target_request(
     })
 }
 
-fn split_host_path(input: &str) -> anyhow::Result<(String, String)> {
+fn split_host_path(input: &str) -> anyhow::Result<(String, Option<u16>, String)> {
     let split_at = input.find(['/', '?']).unwrap_or(input.len());
-    let host = input[..split_at].to_string();
+    let authority = &input[..split_at];
+    let (host, port) = split_authority_host_port(authority)?;
     if host.is_empty() {
         anyhow::bail!("--host must include host");
     }
@@ -180,7 +181,43 @@ fn split_host_path(input: &str) -> anyhow::Result<(String, String)> {
     } else {
         format!("/{rest}")
     };
-    Ok((host, path_and_query))
+    Ok((host, port, path_and_query))
+}
+
+fn split_authority_host_port(authority: &str) -> anyhow::Result<(String, Option<u16>)> {
+    if authority.is_empty() {
+        anyhow::bail!("--host must include host");
+    }
+
+    if let Some(rest) = authority.strip_prefix('[') {
+        let Some(bracket_at) = rest.find(']') else {
+            anyhow::bail!("invalid bracketed IPv6 host");
+        };
+        let host = rest[..bracket_at].to_string();
+        let tail = &rest[bracket_at + 1..];
+        let port = if tail.is_empty() {
+            None
+        } else if let Some(port) = tail.strip_prefix(':') {
+            Some(parse_host_port(port)?)
+        } else {
+            anyhow::bail!("invalid bracketed IPv6 host");
+        };
+        return Ok((host, port));
+    }
+
+    if let Some((host, port)) = authority.rsplit_once(':') {
+        if !host.contains(':') && !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Ok((host.to_string(), Some(parse_host_port(port)?)));
+        }
+    }
+
+    Ok((authority.to_string(), None))
+}
+
+fn parse_host_port(port: &str) -> anyhow::Result<u16> {
+    port.parse::<u16>()
+        .map_err(|_| anyhow::anyhow!("invalid host port: {port}"))
 }
 
 fn normalize_path(path: &str) -> String {
@@ -219,7 +256,20 @@ pub struct HttpRequestSpec {
     pub user_agent: String,
     pub read_mode: ReadMode,
     pub min_body_bytes: usize,
+    pub dpi_detection_bytes: usize,
+    pub verify_transfer_bytes: usize,
     pub max_read_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum TransferLevel {
+    #[default]
+    None,
+    Connected,
+    TlsHandshake,
+    Headers,
+    Body,
+    Verified,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -333,6 +383,9 @@ pub struct ProbeResult {
     pub bytes_read: usize,
     pub header_bytes: usize,
     pub body_bytes: usize,
+    pub total_bytes: usize,
+    pub transfer_level: TransferLevel,
+    pub dpi_suspicious: bool,
     pub failure_kind: Option<FailureKind>,
     pub error_class: Option<ProbeErrorClass>,
     pub error_message: Option<String>,
@@ -369,6 +422,9 @@ impl ProbeResult {
             bytes_read: 0,
             header_bytes: 0,
             body_bytes: 0,
+            total_bytes: 0,
+            transfer_level: TransferLevel::None,
+            dpi_suspicious: false,
             failure_kind: Some(FailureKind::InfrastructureFailure),
             error_class: Some(cls),
             error_message: Some(msg.into()),

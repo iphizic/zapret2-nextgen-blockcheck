@@ -103,21 +103,15 @@ The checker stops after finding enough successful strategies by default:
 ```toml
 [strategies]
 search_mode = "expand"
-max_candidates = 300
-max_per_family = 24
-max_per_action = 8
 round_robin_families = true
-soft_fail_family_limit = 6
 successful_strategy_limit = 40
 ```
 
 Use `--successful-strategy-limit` to override it for one run. With parallel workers,
 the final number of successes can be slightly higher than the limit if several
 in-flight probes succeed in the same batch. `search_mode` can be `signal`,
-`expand`, or `force`; `max_candidates` caps generated concrete strategy variants
-after parameter expansion and de-duplication. `max_per_family`,
-`max_per_action`, and `round_robin_families` keep generated candidates diverse so
-one family does not fill the whole search budget.
+`expand`, or `force`; `round_robin_families` keeps generated candidates
+interleaved by family without capping how many candidates are generated.
 
 On OpenWrt, make sure `nfqws2` exists and is executable. Either set it in
 `config/checker.toml`:

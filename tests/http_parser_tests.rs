@@ -1,7 +1,8 @@
 use zapret_checker::{
     probe::{
-        build_http_request, classify_http_response, parse_http_response_read, parse_http_status,
-        probe_outcome_for_http_status,
+        build_http_request, classify_http_response, compute_dpi_suspicious, compute_transfer_level,
+        parse_http_response_read, parse_http_status, probe_outcome_for_http_status,
+        HttpResponseRead,
     },
     types::*,
 };
@@ -38,6 +39,14 @@ fn maps_http_status_to_probe_outcome() {
         probe_outcome_for_http_status(Some(451)),
         ProbeOutcome::HttpBlockPage
     );
+    assert_eq!(
+        probe_outcome_for_http_status(Some(404)),
+        ProbeOutcome::EmptyResponse
+    );
+    assert_eq!(
+        probe_outcome_for_http_status(Some(302)),
+        ProbeOutcome::Success
+    );
 }
 
 #[test]
@@ -68,6 +77,34 @@ fn parses_target_request_host_mode_with_path() {
     assert_eq!(target.port, 443);
     assert_eq!(target.path_and_query, "/latest/logos/autotrader.svg");
     assert_eq!(target.protocol, ProbeProtocol::Tls12Http11);
+}
+
+#[test]
+fn parses_target_request_host_mode_with_port() {
+    let target = parse_target_request(
+        Some("example.com:8443/status".into()),
+        None,
+        ProbeProtocol::Tls12Http11,
+        false,
+    )
+    .unwrap();
+    assert_eq!(target.host, "example.com");
+    assert_eq!(target.port, 8443);
+    assert_eq!(target.path_and_query, "/status");
+}
+
+#[test]
+fn parses_target_request_bracketed_ipv6_host_mode() {
+    let target = parse_target_request(
+        Some("[2001:db8::1]:8443/status".into()),
+        None,
+        ProbeProtocol::Tls12Http11,
+        false,
+    )
+    .unwrap();
+    assert_eq!(target.host, "2001:db8::1");
+    assert_eq!(target.port, 8443);
+    assert_eq!(target.path_and_query, "/status");
 }
 
 #[test]
@@ -135,11 +172,67 @@ fn parses_http_response_headers_and_body() {
 }
 
 #[test]
-fn body_criteria_requires_body_bytes() {
+fn status_200_body_zero_with_min_body_is_not_success() {
     let (outcome, class, _message) =
         classify_http_response(Some(200), true, 0, HttpMethod::Get, ReadMode::Body, 1);
     assert_ne!(outcome, ProbeOutcome::Success);
     assert_eq!(class, Some(ProbeErrorClass::BodyTooSmall));
+}
+
+#[test]
+fn status_200_body_meets_min_is_success() {
+    let (outcome, class, _message) =
+        classify_http_response(Some(200), true, 64, HttpMethod::Get, ReadMode::Body, 1);
+    assert_eq!(outcome, ProbeOutcome::Success);
+    assert_eq!(class, None);
+}
+
+#[test]
+fn verified_transfer_level_requires_verify_bytes() {
+    let read = HttpResponseRead {
+        status: Some(200),
+        header_bytes: 100,
+        body_bytes: 32768,
+        total_bytes: 32868,
+        first_byte_ms: Some(10),
+        headers_complete: true,
+    };
+    assert_eq!(
+        compute_transfer_level(Some(1), Some(2), &read, 32768, true),
+        TransferLevel::Verified
+    );
+}
+
+#[test]
+fn early_stream_death_is_dpi_suspicious() {
+    assert!(compute_dpi_suspicious(
+        true,
+        4096,
+        16384,
+        ProbeOutcome::TcpReset
+    ));
+    assert!(!compute_dpi_suspicious(
+        true,
+        4096,
+        16384,
+        ProbeOutcome::Success
+    ));
+}
+
+#[test]
+fn non_2xx_is_not_success() {
+    let (outcome, class, _message) =
+        classify_http_response(Some(404), true, 0, HttpMethod::Get, ReadMode::Body, 32_000);
+    assert_ne!(outcome, ProbeOutcome::Success);
+    assert_eq!(class, Some(ProbeErrorClass::InvalidHttpResponse));
+}
+
+#[test]
+fn explicit_block_status_is_not_success() {
+    let (outcome, class, _message) =
+        classify_http_response(Some(403), true, 32_000, HttpMethod::Get, ReadMode::Body, 1);
+    assert_eq!(outcome, ProbeOutcome::HttpBlockPage);
+    assert_eq!(class, Some(ProbeErrorClass::InvalidHttpResponse));
 }
 
 #[test]
@@ -180,6 +273,8 @@ fn request_task(port: u16, user_agent: &str) -> ProbeTask {
             user_agent: user_agent.into(),
             read_mode: ReadMode::Body,
             min_body_bytes: 1,
+            dpi_detection_bytes: 16384,
+            verify_transfer_bytes: 32768,
             max_read_bytes: 65536,
         },
         timeouts: ProbeTimeouts {

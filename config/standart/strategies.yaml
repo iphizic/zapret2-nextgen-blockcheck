@@ -1,796 +1,1700 @@
 version: 1
 kind: zapret2_strategy_catalog
-name: strategies.max_coverage
+name: strategies.maximum_diverse
 schema: zapret2-strategy-catalog/v1
-description: >
-  Broad but parser-safe strategy catalog for zapret2-nextgen-blockcheck.
-  Focus: maximum coverage across HTTP, TLS 1.2, TLS 1.3 and QUIC without
-  unresolved template placeholders.
-
+description: Maximum diverse parser-safe strategy catalog for zapret2-nextgen-blockcheck.
+  Designed for broad family/action coverage without legacy actions, without unresolved
+  placeholders, and with compact parameter lists to avoid excessive repetitions.
 constants:
-  protocols: [http, tls12, tls13, quic]
+  protocols:
+  - http
+  - tls12
+  - tls13
+  - quic
   split_positions:
-    http_core: [1, 2, method+2, host, host+1, midsld, endhost-2, endhost-1, endhost, -1]
-    tls_core: [1, 2, 3, sniext, sniext+1, sniext+4, host, host+1, midsld, endhost-2, endhost-1, endhost, extlen, -1]
+    http_core:
+    - 1
+    - 2
+    - method+2
+    - host+1
+    - midsld
+    - endhost-2
+    - endhost-1
+    - endhost
+    tls_core:
+    - 1
+    - 2
+    - 3
+    - sniext+1
+    - sniext+4
+    - host+1
+    - midsld
+    - endhost-2
+    - endhost-1
+    - extlen
+    tls_multi:
+    - 2,midsld
+    - sniext+1,midsld
+    - host+1,midsld
+    - sniext+1,host+1,endhost-1
   fooling:
-    safe: [none]
-    common: [none, badsum, autottl, badsum_autottl]
-    aggressive: [none, badsum, autottl, badsum_autottl, md5sig, md5sig_autottl, timestamp, badseq, badack]
-  wsize: [1, 2, 4, 8, 16]
-  wscale: [0, 1, 2, 4, 6]
-  hostfake_templates: [random, random.$1D, random.$2D, random.$3D]
-
+    safe:
+    - none
+    common:
+    - none
+    - badsum
+    - autottl
+    - badsum_autottl
+    tcp_desync:
+    - badsum
+    - autottl
+    - badsum_autottl
+  wsize:
+  - 1
+  - 2
+  - 4
+  - 8
+  wscale:
+  - 0
+  - 1
+  - 2
+  - 4
+  - 6
+  ipfrag_pos_tcp:
+  - 8
+  - 16
+  - 24
+  - 32
+  - 48
+  - 64
+  ipfrag_pos_udp:
+  - 8
+  - 16
+  - 32
+  - 64
 bayes_defaults:
-  alpha_beta_prior: [2, 2]
+  alpha_beta_prior:
+  - 2
+  - 2
   penalties:
     cost: 0.03
     risk: 0.04
     expected_time: 0.02
-
 families:
-  - id: baseline
-    enabled: true
-    category: control
-    protocols: [http, tls12, tls13, quic]
-    cost: 0
-    risk: 0
-    prior: [1, 1]
-    actions:
-      - id: direct
-        backend: native
-        no_nfqws: true
-        no_firewall: true
-
-  - id: http_trick
-    enabled: true
-    category: http_header_modification
-    protocols: [http]
-    cost: 1
-    risk: 1
-    prior: [3, 3]
-    actions:
-      - id: http_hostcase
-        function: http_hostcase
-        protocols: [http]
-        params:
-          spell:
-            values: [HoSt, hoSt, HOST, hOSt]
-            default: HoSt
-        render:
-          lua_desync: "http_hostcase:spell={{spell}}"
-      - id: http_domcase
-        function: http_domcase
-        protocols: [http]
-        params: {}
-        render:
-          lua_desync: "http_domcase"
-      - id: http_methodeol
-        function: http_methodeol
-        protocols: [http]
-        params: {}
-        render:
-          lua_desync: "http_methodeol"
-      - id: http_unixeol
-        function: http_unixeol
-        protocols: [http]
-        params: {}
-        render:
-          lua_desync: "http_unixeol"
-
-  - id: split
-    enabled: true
-    category: tcp_segmentation
-    protocols: [http, tls12, tls13]
-    cost: 2
-    risk: 1
-    prior: [4, 2]
-    actions:
-      - id: multisplit_http
-        function: multisplit
-        protocols: [http]
-        params:
-          pos:
-            values: [1, 2, method+2, host, host+1, midsld, endhost-2, endhost-1, endhost, -1]
-            default: midsld
-          fooling:
-            values: [none]
-            default: none
-        render:
-          lua_desync: "multisplit:payload=http_req:pos={{pos}}{{fooling_suffix}}"
-      - id: multisplit_tls
-        function: multisplit
-        protocols: [tls12, tls13]
-        params:
-          pos:
-            values: [1, 2, 3, sniext, sniext+1, sniext+4, host, host+1, midsld, endhost-2, endhost-1, endhost, extlen, -1]
-            default: sniext+1
-          fooling:
-            values: [none]
-            default: none
-        render:
-          lua_desync: "multisplit:payload=tls_client_hello:pos={{pos}}{{fooling_suffix}}"
-      - id: multisplit_multi_pos_tls
-        function: multisplit
-        protocols: [tls12, tls13]
-        params:
-          pos:
-            values: ["2,midsld", "sniext+1,midsld", "host+1,midsld", "sniext+1,host+1,endhost-1"]
-            default: "sniext+1,midsld"
-        render:
-          lua_desync: "multisplit:payload=tls_client_hello:pos={{pos}}"
-
-  - id: disorder
-    enabled: true
-    category: tcp_segmentation_reverse_order
-    protocols: [http, tls12, tls13]
-    cost: 3
-    risk: 2
-    prior: [3, 2]
-    actions:
-      - id: multidisorder_http
-        function: multidisorder
-        protocols: [http]
-        params:
-          pos:
-            values: [1, 2, method+2, host, host+1, midsld, endhost-2, endhost-1, endhost, -1]
-            default: midsld
-          fooling:
-            values: [none]
-            default: none
-        render:
-          lua_desync: "multidisorder:payload=http_req:pos={{pos}}{{fooling_suffix}}"
-      - id: multidisorder_tls
-        function: multidisorder
-        protocols: [tls12, tls13]
-        params:
-          pos:
-            values: [1, 2, 3, sniext, sniext+1, sniext+4, host, host+1, midsld, endhost-2, endhost-1, endhost, extlen, -1]
-            default: sniext+1
-          fooling:
-            values: [none]
-            default: none
-        render:
-          lua_desync: "multidisorder:payload=tls_client_hello:pos={{pos}}{{fooling_suffix}}"
-  - id: fake
-    enabled: true
-    category: direct_fake_packet
-    protocols: [http, tls12, tls13, quic]
-    cost: 3
-    risk: 2
-    prior: [3, 3]
-    actions:
-      - id: fake_http
-        function: fake
-        protocols: [http]
-        params:
-          blob:
-            values: [fake_default_http, fake_dir_http]
-            default: fake_default_http
-          fooling:
-            values: [none, badsum, autottl, badsum_autottl]
-            default: none
-        render:
-          lua_desync: "fake:payload=http_req:blob={{blob}}{{fooling_suffix}}"
-      - id: fake_tls
-        function: fake
-        protocols: [tls12, tls13]
-        params:
-          blob:
-            values: [fake_default_tls, fake_dir_tls]
-            default: fake_default_tls
-          tls_mod:
-            values: [none, random_sni, random_session_id]
-            default: none
-          fooling:
-            values: [none, badsum, autottl, badsum_autottl]
-            default: none
-        render:
-          lua_desync: "fake:payload=tls_client_hello:blob={{blob}}{{tls_mod_suffix}}{{fooling_suffix}}"
-      - id: fake_quic
-        function: fake
-        protocols: [quic]
-        params:
-          blob:
-            values: [fake_default_quic, fake_dir_quic]
-            default: fake_default_quic
-          repeats:
-            values: [1, 2, 5, 10, 20]
-            default: 1
-          fooling:
-            values: [none, autottl]
-            default: none
-        render:
-          lua_desync: "fake:payload=quic_initial:blob={{blob}}:repeats={{repeats}}{{fooling_suffix}}"
-
-  - id: rst
-    enabled: true
-    category: direct_reset_packet
-    protocols: [http, tls12, tls13]
-    cost: 4
-    risk: 3
-    prior: [2, 3]
-    actions:
-      - id: rst_http
-        function: rst
-        protocols: [http]
-        params:
-          rstack:
-            values: [false, true]
-            default: false
-          fooling:
-            values: [none, badsum, autottl, badsum_autottl]
-            default: badsum
-        render:
-          lua_desync: "rst:payload=http_req{{rstack_suffix}}{{fooling_suffix}}"
-      - id: rst_tls
-        function: rst
-        protocols: [tls12, tls13]
-        params:
-          rstack:
-            values: [false, true]
-            default: false
-          fooling:
-            values: [none, badsum, autottl, badsum_autottl]
-            default: badsum
-        render:
-          lua_desync: "rst:payload=tls_client_hello{{rstack_suffix}}{{fooling_suffix}}"
-
-  - id: syndata
-    enabled: true
-    category: tcp_syn_payload_fake
-    protocols: [http, tls12, tls13]
-    cost: 6
-    risk: 5
-    prior: [1, 4]
-    actions:
-      - id: syndata_http
-        function: syndata
-        protocols: [http]
-        params:
-          blob:
-            values: [fake_default_http, fake_dir_http]
-            default: fake_default_http
-          fooling:
-            values: [none, badsum, autottl]
-            default: none
-        render:
-          lua_desync: "syndata:blob={{blob}}{{fooling_suffix}}"
-      - id: syndata_tls
-        function: syndata
-        protocols: [tls12, tls13]
-        params:
-          blob:
-            values: [fake_default_tls, fake_dir_tls]
-            default: fake_default_tls
-          fooling:
-            values: [none, badsum, autottl]
-            default: none
-        render:
-          lua_desync: "syndata:blob={{blob}}{{fooling_suffix}}"
-
-  - id: seqovl
-    enabled: true
-    category: tcp_sequence_overlap
-    protocols: [http, tls12, tls13]
-    cost: 5
-    risk: 3
-    prior: [2, 3]
-    actions:
-      - id: multisplit_seqovl_http
-        function: multisplit
-        protocols: [http]
-        params:
-          pos:
-            values: [host, host+1, midsld, endhost-1]
-            default: midsld
-          seqovl:
-            values: [1, 2, 4, 8, midsld-1]
-            default: 1
-          seqovl_pattern:
-            values: [zero, random]
-            default: zero
-        render:
-          lua_desync: "multisplit:payload=http_req:pos={{pos}}:seqovl={{seqovl}}{{seqovl_pattern_suffix}}"
-      - id: multisplit_seqovl_tls
-        function: multisplit
-        protocols: [tls12, tls13]
-        params:
-          pos:
-            values: [sniext+1, sniext+4, host+1, midsld, endhost-1]
-            default: midsld
-          seqovl:
-            values: [1, 2, 4, 8, midsld-1]
-            default: 1
-          seqovl_pattern:
-            values: [zero, random]
-            default: zero
-        render:
-          lua_desync: "multisplit:payload=tls_client_hello:pos={{pos}}:seqovl={{seqovl}}{{seqovl_pattern_suffix}}"
-      - id: tcpseg_seqovl
-        function: tcpseg
-        protocols: [http, tls12, tls13]
-        params:
-          pos:
-            values: ["0,-1", "0,midsld", "host,endhost"]
-            default: "0,midsld"
-          seqovl:
-            values: [1, 2, 4, 8]
-            default: 1
-        render:
-          lua_desync: "tcpseg:pos={{pos}}:seqovl={{seqovl}}"
-
-  - id: faked_split
-    enabled: true
-    category: fake_interleaved_tcp_segmentation
-    protocols: [http, tls12, tls13]
-    cost: 4
-    risk: 3
-    prior: [2, 2]
-    actions:
-      - id: fakedsplit_http
-        function: fakedsplit
-        protocols: [http]
-        params:
-          pos:
-            values: [host, host+1, midsld, endhost-1]
-            default: midsld
-          fooling:
-            values: [badsum, autottl, badsum_autottl]
-            default: badsum
-          pattern:
-            values: [zero, random]
-            default: zero
-        render:
-          lua_desync: "fakedsplit:payload=http_req:pos={{pos}}{{fooling_suffix}}{{pattern_suffix}}"
-      - id: fakedsplit_tls
-        function: fakedsplit
-        protocols: [tls12, tls13]
-        params:
-          pos:
-            values: [sniext+1, host+1, midsld, endhost-1]
-            default: midsld
-          fooling:
-            values: [badsum, autottl, badsum_autottl]
-            default: badsum
-          pattern:
-            values: [zero, random]
-            default: zero
-        render:
-          lua_desync: "fakedsplit:payload=tls_client_hello:pos={{pos}}{{fooling_suffix}}{{pattern_suffix}}"
-      - id: fakeddisorder_tls
-        function: fakeddisorder
-        protocols: [tls12, tls13]
-        params:
-          pos:
-            values: [sniext+1, host+1, midsld, endhost-1]
-            default: midsld
-          fooling:
-            values: [badsum, autottl, badsum_autottl]
-            default: badsum
-          pattern:
-            values: [zero, random]
-            default: zero
-        render:
-          lua_desync: "fakeddisorder:payload=tls_client_hello:pos={{pos}}{{fooling_suffix}}{{pattern_suffix}}"
-
-  - id: hostfake
-    enabled: true
-    category: host_fake_split
-    protocols: [http, tls12, tls13]
-    cost: 4
-    risk: 3
-    prior: [2, 2]
-    actions:
-      - id: hostfakesplit_http
-        function: hostfakesplit
-        protocols: [http]
-        params:
-          host_template:
-            values: [random, random.$1D, random.$2D, random.$3D]
-            default: random
-          midhost:
-            values: [none, midsld, host+1]
-            default: none
-          disorder_after:
-            values: [none, endhost, endhost+1]
-            default: none
-          fooling:
-            values: [badsum, autottl, badsum_autottl]
-            default: badsum
-        render:
-          lua_desync: "hostfakesplit:payload=http_req:host={{host_template}}{{midhost_suffix}}{{disorder_after_suffix}}{{fooling_suffix}}"
-      - id: hostfakesplit_tls
-        function: hostfakesplit
-        protocols: [tls12, tls13]
-        params:
-          host_template:
-            values: [random, random.$1D, random.$2D, random.$3D]
-            default: random
-          midhost:
-            values: [none, midsld, host+1]
-            default: none
-          disorder_after:
-            values: [none, endhost, endhost+1]
-            default: none
-          fooling:
-            values: [badsum, autottl, badsum_autottl]
-            default: badsum
-        render:
-          lua_desync: "hostfakesplit:payload=tls_client_hello:host={{host_template}}{{midhost_suffix}}{{disorder_after_suffix}}{{fooling_suffix}}"
-
-  - id: ipfrag
-    enabled: true
-    category: ip_fragmentation
-    protocols: [http, tls12, tls13, quic]
-    cost: 6
-    risk: 4
-    prior: [1, 3]
-    actions:
-      - id: fake_ipfrag_tcp
-        function: fake
-        protocols: [http, tls12, tls13]
-        params:
-          blob:
-            values: [fake_default_http, fake_default_tls, fake_dir_http, fake_dir_tls]
-            default: fake_default_tls
-          ipfrag_pos:
-            values: [8, 16, 24, 32, 48, 64, 96]
-            default: 24
-          fooling:
-            values: [none, badsum, autottl]
-            default: none
-        render:
-          lua_desync: "fake:blob={{blob}}:ipfrag:ipfrag_pos_tcp={{ipfrag_pos}}{{fooling_suffix}}"
-      - id: multisplit_ipfrag_tcp
-        function: multisplit
-        protocols: [http, tls12, tls13]
-        params:
-          pos:
-            values: [midsld, host+1, sniext+1]
-            default: midsld
-          ipfrag_pos:
-            values: [8, 16, 24, 32, 48, 64]
-            default: 24
-        render:
-          lua_desync: "multisplit:pos={{pos}}:ipfrag:ipfrag_pos_tcp={{ipfrag_pos}}"
-      - id: fake_ipfrag_udp
-        function: fake
-        protocols: [quic]
-        params:
-          blob:
-            values: [fake_default_quic, fake_dir_quic]
-            default: fake_default_quic
-          ipfrag_pos:
-            values: [8, 16, 32, 64, 96]
-            default: 32
-          repeats:
-            values: [1, 2, 5]
-            default: 1
-        render:
-          lua_desync: "fake:blob={{blob}}:repeats={{repeats}}:ipfrag:ipfrag_pos_udp={{ipfrag_pos}}"
-
+- id: baseline
+  enabled: true
+  category: control
+  protocols:
+  - http
+  - tls12
+  - tls13
+  - quic
+  cost: 0
+  risk: 0
+  prior:
+  - 1
+  - 1
+  actions:
+  - id: direct
+    backend: native
+    no_nfqws: true
+    no_firewall: true
+- id: http_trick
+  enabled: true
+  category: http_header_modification
+  protocols:
+  - http
+  cost: 1
+  risk: 1
+  prior:
+  - 3
+  - 3
+  actions:
+  - id: http_hostcase
+    function: http_hostcase
+    protocols:
+    - http
+    params:
+      spell:
+        values:
+        - HoSt
+        - hoSt
+        - HOST
+        - hOSt
+        default: HoSt
+    render:
+      lua_desync: http_hostcase:spell={{spell}}
+  - id: http_domcase
+    function: http_domcase
+    protocols:
+    - http
+    params: {}
+    render:
+      lua_desync: http_domcase
+  - id: http_methodeol
+    function: http_methodeol
+    protocols:
+    - http
+    params: {}
+    render:
+      lua_desync: http_methodeol
+  - id: http_unixeol
+    function: http_unixeol
+    protocols:
+    - http
+    params: {}
+    render:
+      lua_desync: http_unixeol
+- id: split
+  enabled: true
+  category: tcp_segmentation
+  protocols:
+  - http
+  - tls12
+  - tls13
+  cost: 2
+  risk: 1
+  prior:
+  - 4
+  - 2
+  actions:
+  - id: multisplit_http
+    function: multisplit
+    protocols:
+    - http
+    params:
+      pos:
+        values: &id001
+        - 1
+        - 2
+        - method+2
+        - host+1
+        - midsld
+        - endhost-2
+        - endhost-1
+        - endhost
+        default: midsld
+      fooling:
+        values:
+        - none
+        default: none
+    render:
+      lua_desync: multisplit:payload=http_req:pos={{pos}}{{fooling_suffix}}
+  - id: multisplit_tls
+    function: multisplit
+    protocols:
+    - tls12
+    - tls13
+    params:
+      pos:
+        values: &id002
+        - 1
+        - 2
+        - 3
+        - sniext+1
+        - sniext+4
+        - host+1
+        - midsld
+        - endhost-2
+        - endhost-1
+        - extlen
+        default: sniext+1
+      fooling:
+        values:
+        - none
+        default: none
+    render:
+      lua_desync: multisplit:payload=tls_client_hello:pos={{pos}}{{fooling_suffix}}
+  - id: multisplit_multi_pos_tls
+    function: multisplit
+    protocols:
+    - tls12
+    - tls13
+    params:
+      pos:
+        values:
+        - 2,midsld
+        - sniext+1,midsld
+        - host+1,midsld
+        - sniext+1,host+1,endhost-1
+        default: sniext+1,midsld
+    render:
+      lua_desync: multisplit:payload=tls_client_hello:pos={{pos}}
+- id: disorder
+  enabled: true
+  category: tcp_segmentation_reverse_order
+  protocols:
+  - http
+  - tls12
+  - tls13
+  cost: 3
+  risk: 2
+  prior:
+  - 3
+  - 2
+  actions:
+  - id: multidisorder_http
+    function: multidisorder
+    protocols:
+    - http
+    params:
+      pos:
+        values: *id001
+        default: midsld
+      fooling:
+        values:
+        - none
+        default: none
+    render:
+      lua_desync: multidisorder:payload=http_req:pos={{pos}}{{fooling_suffix}}
+  - id: multidisorder_tls
+    function: multidisorder
+    protocols:
+    - tls12
+    - tls13
+    params:
+      pos:
+        values: *id002
+        default: sniext+1
+      fooling:
+        values:
+        - none
+        default: none
+    render:
+      lua_desync: multidisorder:payload=tls_client_hello:pos={{pos}}{{fooling_suffix}}
+- id: fake
+  enabled: true
+  category: direct_fake_packet
+  protocols:
+  - http
+  - tls12
+  - tls13
+  - quic
+  cost: 3
+  risk: 2
+  prior:
+  - 3
+  - 3
+  actions:
+  - id: fake_http
+    function: fake
+    protocols:
+    - http
+    params:
+      blob:
+        values:
+        - fake_default_http
+        default: fake_default_http
+      fooling:
+        values:
+        - none
+        - badsum
+        - autottl
+        - badsum_autottl
+        default: none
+    render:
+      lua_desync: fake:payload=http_req:blob={{blob}}{{fooling_suffix}}
+  - id: fake_tls
+    function: fake
+    protocols:
+    - tls12
+    - tls13
+    params:
+      blob:
+        values:
+        - fake_default_tls
+        default: fake_default_tls
+      tls_mod:
+        values:
+        - none
+        - random_sni
+        - random_session_id
+        default: none
+      fooling:
+        values:
+        - none
+        - badsum
+        - autottl
+        - badsum_autottl
+        default: none
+    render:
+      lua_desync: fake:payload=tls_client_hello:blob={{blob}}{{tls_mod_suffix}}{{fooling_suffix}}
+  - id: fake_quic
+    function: fake
+    protocols:
+    - quic
+    params:
+      blob:
+        values:
+        - fake_default_quic
+        default: fake_default_quic
+      repeats:
+        values:
+        - 1
+        - 2
+        - 5
+        - 10
+        default: 1
+      fooling:
+        values:
+        - none
+        - autottl
+        default: none
+    render:
+      lua_desync: fake:payload=quic_initial:blob={{blob}}:repeats={{repeats}}{{fooling_suffix}}
+- id: rst
+  enabled: true
+  category: direct_reset_packet
+  protocols:
+  - http
+  - tls12
+  - tls13
+  cost: 4
+  risk: 3
+  prior:
+  - 2
+  - 3
+  actions:
+  - id: rst_http
+    function: rst
+    protocols:
+    - http
+    params:
+      rstack:
+        values:
+        - false
+        - true
+        default: false
+      fooling:
+        values:
+        - none
+        - badsum
+        - autottl
+        - badsum_autottl
+        default: badsum
+    render:
+      lua_desync: rst:payload=http_req{{rstack_suffix}}{{fooling_suffix}}
+  - id: rst_tls
+    function: rst
+    protocols:
+    - tls12
+    - tls13
+    params:
+      rstack:
+        values:
+        - false
+        - true
+        default: false
+      fooling:
+        values:
+        - none
+        - badsum
+        - autottl
+        - badsum_autottl
+        default: badsum
+    render:
+      lua_desync: rst:payload=tls_client_hello{{rstack_suffix}}{{fooling_suffix}}
+- id: syndata
+  enabled: true
+  category: tcp_syn_payload_fake
+  protocols:
+  - http
+  - tls12
+  - tls13
+  cost: 6
+  risk: 5
+  prior:
+  - 1
+  - 4
+  actions:
+  - id: syndata_http
+    function: syndata
+    protocols:
+    - http
+    params:
+      blob:
+        values:
+        - fake_default_http
+        default: fake_default_http
+      fooling:
+        values:
+        - none
+        - badsum
+        - autottl
+        - badsum_autottl
+        default: none
+    render:
+      lua_desync: syndata:blob={{blob}}{{fooling_suffix}}
+  - id: syndata_tls
+    function: syndata
+    protocols:
+    - tls12
+    - tls13
+    params:
+      blob:
+        values:
+        - fake_default_tls
+        default: fake_default_tls
+      fooling:
+        values:
+        - none
+        - badsum
+        - autottl
+        - badsum_autottl
+        default: none
+    render:
+      lua_desync: syndata:blob={{blob}}{{fooling_suffix}}
+- id: seqovl
+  enabled: true
+  category: tcp_sequence_overlap
+  protocols:
+  - http
+  - tls12
+  - tls13
+  cost: 5
+  risk: 3
+  prior:
+  - 2
+  - 3
+  actions:
+  - id: multisplit_seqovl_http
+    function: multisplit
+    protocols:
+    - http
+    params:
+      pos:
+        values:
+        - host+1
+        - midsld
+        - endhost-2
+        - endhost-1
+        default: midsld
+      seqovl:
+        values:
+        - 1
+        - 2
+        - 4
+        - 8
+        - midsld-1
+        default: 1
+      seqovl_pattern:
+        values:
+        - zero
+        - random
+        default: zero
+    render:
+      lua_desync: multisplit:payload=http_req:pos={{pos}}:seqovl={{seqovl}}{{seqovl_pattern_suffix}}
+  - id: multisplit_seqovl_tls
+    function: multisplit
+    protocols:
+    - tls12
+    - tls13
+    params:
+      pos:
+        values:
+        - sniext+1
+        - sniext+4
+        - host+1
+        - midsld
+        - endhost-1
+        default: midsld
+      seqovl:
+        values:
+        - 1
+        - 2
+        - 4
+        - 8
+        - midsld-1
+        default: 1
+      seqovl_pattern:
+        values:
+        - zero
+        - random
+        default: zero
+    render:
+      lua_desync: multisplit:payload=tls_client_hello:pos={{pos}}:seqovl={{seqovl}}{{seqovl_pattern_suffix}}
+  - id: tcpseg_seqovl
+    function: tcpseg
+    protocols:
+    - http
+    - tls12
+    - tls13
+    params:
+      pos:
+        values:
+        - 0,-1
+        - 0,midsld
+        - host,endhost
+        default: 0,midsld
+      seqovl:
+        values:
+        - 1
+        - 2
+        - 4
+        - 8
+        default: 1
+    render:
+      lua_desync: tcpseg:pos={{pos}}:seqovl={{seqovl}}
+- id: faked_split
+  enabled: true
+  category: fake_interleaved_tcp_segmentation
+  protocols:
+  - http
+  - tls12
+  - tls13
+  cost: 4
+  risk: 3
+  prior:
+  - 2
+  - 2
+  actions:
+  - id: fakedsplit_http
+    function: fakedsplit
+    protocols:
+    - http
+    params:
+      pos:
+        values:
+        - host+1
+        - midsld
+        - endhost-2
+        - endhost-1
+        default: midsld
+      fooling:
+        values:
+        - badsum
+        - autottl
+        - badsum_autottl
+        default: badsum
+      pattern:
+        values:
+        - zero
+        - random
+        default: zero
+    render:
+      lua_desync: fakedsplit:payload=http_req:pos={{pos}}{{fooling_suffix}}{{pattern_suffix}}
+  - id: fakedsplit_tls
+    function: fakedsplit
+    protocols:
+    - tls12
+    - tls13
+    params:
+      pos:
+        values:
+        - sniext+1
+        - sniext+4
+        - host+1
+        - midsld
+        - endhost-2
+        - endhost-1
+        default: midsld
+      fooling:
+        values:
+        - badsum
+        - autottl
+        - badsum_autottl
+        default: badsum
+      pattern:
+        values:
+        - zero
+        - random
+        default: zero
+    render:
+      lua_desync: fakedsplit:payload=tls_client_hello:pos={{pos}}{{fooling_suffix}}{{pattern_suffix}}
+  - id: fakeddisorder_tls
+    function: fakeddisorder
+    protocols:
+    - tls12
+    - tls13
+    params:
+      pos:
+        values:
+        - sniext+1
+        - sniext+4
+        - host+1
+        - midsld
+        - endhost-2
+        - endhost-1
+        default: midsld
+      fooling:
+        values:
+        - badsum
+        - autottl
+        - badsum_autottl
+        default: badsum
+      pattern:
+        values:
+        - zero
+        - random
+        default: zero
+    render:
+      lua_desync: fakeddisorder:payload=tls_client_hello:pos={{pos}}{{fooling_suffix}}{{pattern_suffix}}
+- id: hostfake
+  enabled: true
+  category: host_fake_split
+  protocols:
+  - http
+  - tls12
+  - tls13
+  cost: 4
+  risk: 3
+  prior:
+  - 2
+  - 2
+  actions:
+  - id: hostfakesplit_http
+    function: hostfakesplit
+    protocols:
+    - http
+    params:
+      host_template:
+        values:
+        - random
+        - random.$1D
+        - random.$2D
+        - random.$3D
+        default: random
+      midhost:
+        values:
+        - none
+        - midsld
+        - host+1
+        default: none
+      disorder_after:
+        values:
+        - none
+        - endhost
+        - endhost+1
+        default: none
+      fooling:
+        values:
+        - badsum
+        - autottl
+        - badsum_autottl
+        default: badsum
+    render:
+      lua_desync: hostfakesplit:payload=http_req:host={{host_template}}{{midhost_suffix}}{{disorder_after_suffix}}{{fooling_suffix}}
+  - id: hostfakesplit_tls
+    function: hostfakesplit
+    protocols:
+    - tls12
+    - tls13
+    params:
+      host_template:
+        values:
+        - random
+        - random.$1D
+        - random.$2D
+        - random.$3D
+        default: random
+      midhost:
+        values:
+        - none
+        - midsld
+        - host+1
+        default: none
+      disorder_after:
+        values:
+        - none
+        - endhost
+        - endhost+1
+        default: none
+      fooling:
+        values:
+        - badsum
+        - autottl
+        - badsum_autottl
+        default: badsum
+    render:
+      lua_desync: hostfakesplit:payload=tls_client_hello:host={{host_template}}{{midhost_suffix}}{{disorder_after_suffix}}{{fooling_suffix}}
+- id: ipfrag
+  enabled: true
+  category: ip_fragmentation
+  protocols:
+  - http
+  - tls12
+  - tls13
+  - quic
+  cost: 6
+  risk: 4
+  prior:
+  - 1
+  - 3
+  actions:
+  - id: fake_ipfrag_tcp
+    function: fake
+    protocols:
+    - http
+    - tls12
+    - tls13
+    params:
+      blob:
+        values:
+        - fake_default_http
+        - fake_default_tls
+        default: fake_default_tls
+      ipfrag_pos:
+        values:
+        - 8
+        - 16
+        - 24
+        - 32
+        - 48
+        - 64
+        default: 24
+      fooling:
+        values:
+        - none
+        - badsum
+        - autottl
+        default: none
+    render:
+      lua_desync: fake:blob={{blob}}:ipfrag:ipfrag_pos_tcp={{ipfrag_pos}}{{fooling_suffix}}
+  - id: multisplit_ipfrag_tcp
+    function: multisplit
+    protocols:
+    - http
+    - tls12
+    - tls13
+    params:
+      pos:
+        values:
+        - sniext+1
+        - host+1
+        - midsld
+        default: midsld
+      ipfrag_pos:
+        values:
+        - 8
+        - 16
+        - 24
+        - 32
+        - 48
+        - 64
+        default: 24
+    render:
+      lua_desync: multisplit:pos={{pos}}:ipfrag:ipfrag_pos_tcp={{ipfrag_pos}}
+  - id: fake_ipfrag_udp
+    function: fake
+    protocols:
+    - quic
+    params:
+      blob:
+        values:
+        - fake_default_quic
+        default: fake_default_quic
+      ipfrag_pos:
+        values:
+        - 8
+        - 16
+        - 32
+        - 64
+        default: 32
+      repeats:
+        values:
+        - 1
+        - 2
+        - 5
+        default: 1
+    render:
+      lua_desync: fake:blob={{blob}}:repeats={{repeats}}:ipfrag:ipfrag_pos_udp={{ipfrag_pos}}
+- id: wsize
+  enabled: true
+  category: tcp_window_rewrite
+  protocols:
+  - http
+  - tls12
+  - tls13
+  cost: 7
+  risk: 5
+  prior:
+  - 1
+  - 4
+  actions:
   - id: wsize
-    enabled: true
-    category: tcp_window_rewrite
-    protocols: [http, tls12, tls13]
-    cost: 7
-    risk: 5
-    prior: [1, 4]
-    actions:
-      - id: wsize
-        function: wsize
-        protocols: [http, tls12, tls13]
-        params:
-          wsize:
-            values: [1, 2, 4, 8, 16]
-            default: 1
-          scale:
-            values: [0, 1, 2, 4, 6]
-            default: 6
-        render:
-          lua_desync: "wsize:wsize={{wsize}}:scale={{scale}}"
-      - id: wssize
-        function: wssize
-        protocols: [http, tls12, tls13]
-        params:
-          wsize:
-            values: [1, 2, 4, 8, 16]
-            default: 1
-          scale:
-            values: [0, 1, 2, 4, 6]
-            default: 6
-        render:
-          lua_desync: "wssize:wsize={{wsize}}:scale={{scale}}"
-
-  - id: oob
-    enabled: true
-    category: tcp_oob_urgent_pointer
-    protocols: [http, tls12, tls13]
-    cost: 7
-    risk: 5
-    prior: [1, 4]
-    actions:
-      - id: oob_byte
-        function: oob
-        protocols: [http, tls12, tls13]
-        params:
-          byte:
-            values: [0, 1, 13, 32, 255]
-            default: 0
-          urp:
-            values: [b, e, host, midsld]
-            default: b
-          fooling:
-            values: [none]
-            default: none
-        render:
-          lua_desync: "oob:byte={{byte}}:urp={{urp}}{{fooling_suffix}}"
-      - id: oob_char
-        function: oob
-        protocols: [http, tls12, tls13]
-        params:
-          char:
-            values: [" ", A, "0"]
-            default: " "
-          urp:
-            values: [b, e, host, midsld]
-            default: b
-        render:
-          lua_desync: "oob:char={{char}}:urp={{urp}}"
-
-  - id: udp_len
-    enabled: true
-    category: udp_payload_length_modification
-    protocols: [quic]
-    cost: 5
-    risk: 4
-    prior: [2, 3]
-    actions:
-      - id: udplen_increase
-        function: udplen
-        protocols: [quic]
-        params:
-          increment:
-            values: [1, 2, 4, 8, 16, 32]
-            default: 4
-          min:
-            values: [0, 8, 16]
-            default: 0
-          max:
-            values: [0, 1200, 1500]
-            default: 0
-          pattern:
-            values: [zero, random]
-            default: zero
-        render:
-          lua_desync: "udplen:increment={{increment}}:min={{min}}:max={{max}}{{pattern_suffix}}"
-
+    function: wsize
+    protocols:
+    - http
+    - tls12
+    - tls13
+    params:
+      wsize:
+        values:
+        - 1
+        - 2
+        - 4
+        - 8
+        default: 1
+      scale:
+        values:
+        - 0
+        - 1
+        - 2
+        - 4
+        - 6
+        default: 6
+    render:
+      lua_desync: wsize:wsize={{wsize}}:scale={{scale}}
+  - id: wssize
+    function: wssize
+    protocols:
+    - http
+    - tls12
+    - tls13
+    params:
+      wsize:
+        values:
+        - 1
+        - 2
+        - 4
+        - 8
+        default: 1
+      scale:
+        values:
+        - 0
+        - 1
+        - 2
+        - 4
+        - 6
+        default: 6
+    render:
+      lua_desync: wssize:wsize={{wsize}}:scale={{scale}}
+- id: oob
+  enabled: true
+  category: tcp_oob_urgent_pointer
+  protocols:
+  - http
+  - tls12
+  - tls13
+  cost: 7
+  risk: 5
+  prior:
+  - 1
+  - 4
+  actions:
+  - id: oob_byte
+    function: oob
+    protocols:
+    - http
+    - tls12
+    - tls13
+    params:
+      byte:
+        values:
+        - 0
+        - 1
+        - 13
+        - 32
+        default: 0
+      urp:
+        values:
+        - b
+        - e
+        - host
+        - midsld
+        default: b
+      fooling:
+        values:
+        - none
+        default: none
+    render:
+      lua_desync: oob:byte={{byte}}:urp={{urp}}{{fooling_suffix}}
+  - id: oob_char
+    function: oob
+    protocols:
+    - http
+    - tls12
+    - tls13
+    params:
+      char:
+        values:
+        - ' '
+        - A
+        - '0'
+        default: ' '
+      urp:
+        values:
+        - b
+        - e
+        - host
+        - midsld
+        default: b
+    render:
+      lua_desync: oob:char={{char}}:urp={{urp}}
+- id: udp_len
+  enabled: true
+  category: udp_payload_length_modification
+  protocols:
+  - quic
+  cost: 5
+  risk: 4
+  prior:
+  - 2
+  - 3
+  actions:
+  - id: udplen_increase
+    function: udplen
+    protocols:
+    - quic
+    params:
+      increment:
+        values:
+        - 1
+        - 2
+        - 4
+        - 8
+        default: 4
+      min:
+        values:
+        - 0
+        - 8
+        default: 0
+      max:
+        values:
+        - 0
+        - 1200
+        default: 0
+      pattern:
+        values:
+        - zero
+        - random
+        default: zero
+    render:
+      lua_desync: udplen:increment={{increment}}:min={{min}}:max={{max}}{{pattern_suffix}}
 candidate_generators:
-  # Broad enough for real search, still useful with max_candidates caps.
   signal:
     http:
-      - family: http_trick
-        actions: [http_hostcase, http_domcase, http_methodeol, http_unixeol]
-      - family: split
-        actions: [multisplit_http]
-        params:
-          pos: [1, 2, method+2, host, host+1, midsld, endhost-1, endhost]
-      - family: disorder
-        actions: [multidisorder_http]
-        params:
-          pos: [host, host+1, midsld, endhost-1]
-      - family: fake
-        actions: [fake_http]
-        params:
-          blob: [fake_default_http, fake_dir_http]
-          fooling: [none, badsum, autottl, badsum_autottl]
-      - family: rst
-        actions: [rst_http]
-        params:
-          rstack: [false, true]
-          fooling: [badsum, autottl, badsum_autottl]
-      - family: faked_split
-        actions: [fakedsplit_http]
-        params:
-          pos: [host, host+1, midsld, endhost-2, endhost-1]
-          fooling: [badsum, autottl, badsum_autottl]
-          pattern: [zero, random]
-      - family: hostfake
-        actions: [hostfakesplit_http]
-        params:
-          host_template: [random, random.$1D, random.$2D, random.$3D]
-          midhost: [none, midsld, host+1]
-          disorder_after: [none, endhost, endhost+1]
-          fooling: [badsum, autottl, badsum_autottl]
-      - family: seqovl
-        actions: [multisplit_seqovl_http, tcpseg_seqovl]
-        params:
-          pos: [host+1, midsld, endhost-1, "0,-1", "0,midsld", "host,endhost"]
-          seqovl: [1, 2, 4, 8, midsld-1]
-          seqovl_pattern: [zero, random]
-      - family: ipfrag
-        actions: [fake_ipfrag_tcp, multisplit_ipfrag_tcp]
-        params:
-          blob: [fake_default_http, fake_dir_http]
-          pos: [host+1, midsld]
-          ipfrag_pos: [16, 24, 32, 48, 64]
-          fooling: [none, badsum, autottl]
-      - family: wsize
-        actions: [wsize, wssize]
-        params:
-          wsize: [1, 2, 4, 8]
-          scale: [0, 1, 2, 4, 6]
-      - family: oob
-        actions: [oob_byte, oob_char]
-        params:
-          byte: [0, 1, 13, 32]
-          char: [" ", A, "0"]
-          urp: [b, e, host, midsld]
-
+    - family: http_trick
+      actions:
+      - http_hostcase
+      - http_domcase
+      - http_methodeol
+      - http_unixeol
+    - family: split
+      actions:
+      - multisplit_http
+      params:
+        pos: *id001
+    - family: disorder
+      actions:
+      - multidisorder_http
+      params:
+        pos:
+        - host+1
+        - midsld
+        - endhost-2
+        - endhost-1
+    - family: fake
+      actions:
+      - fake_http
+      params:
+        blob:
+        - fake_default_http
+        fooling:
+        - none
+        - badsum
+        - autottl
+        - badsum_autottl
+    - family: syndata
+      actions:
+      - syndata_http
+      params:
+        blob:
+        - fake_default_http
+        fooling:
+        - none
+        - badsum
+        - autottl
+    - family: faked_split
+      actions:
+      - fakedsplit_http
+      params:
+        pos:
+        - host+1
+        - midsld
+        - endhost-2
+        - endhost-1
+        fooling:
+        - badsum
+        - autottl
+        - badsum_autottl
+        pattern:
+        - zero
+        - random
+    - family: seqovl
+      actions:
+      - multisplit_seqovl_http
+      params:
+        pos:
+        - host+1
+        - midsld
+        - endhost-2
+        - endhost-1
+        seqovl:
+        - 1
+        - 2
+        - 4
+        - 8
+        - midsld-1
+        seqovl_pattern:
+        - zero
+        - random
+    - family: seqovl
+      actions:
+      - tcpseg_seqovl
+      params:
+        pos:
+        - 0,-1
+        - 0,midsld
+        - host,endhost
+        seqovl:
+        - 1
+        - 2
+        - 4
+        - 8
+    - family: ipfrag
+      actions:
+      - fake_ipfrag_tcp
+      params:
+        blob:
+        - fake_default_http
+        ipfrag_pos:
+        - 16
+        - 24
+        - 32
+        - 48
+        - 64
+        fooling:
+        - none
+        - badsum
+        - autottl
+    - family: ipfrag
+      actions:
+      - multisplit_ipfrag_tcp
+      params:
+        pos:
+        - host+1
+        - midsld
+        ipfrag_pos:
+        - 16
+        - 24
+        - 32
+        - 48
+        - 64
+    - family: wsize
+      actions:
+      - wsize
+      - wssize
+      params:
+        wsize:
+        - 1
+        - 2
+        - 4
+        - 8
+        scale:
+        - 0
+        - 1
+        - 2
+        - 4
+        - 6
+    - family: oob
+      actions:
+      - oob_byte
+      params:
+        byte:
+        - 0
+        - 1
+        - 13
+        - 32
+        urp:
+        - b
+        - e
+        - host
+        - midsld
+    - family: oob
+      actions:
+      - oob_char
+      params:
+        char:
+        - ' '
+        - A
+        - '0'
+        urp:
+        - b
+        - e
+        - host
+        - midsld
     tls12:
-      - family: split
-        actions: [multisplit_tls, multisplit_multi_pos_tls]
-        params:
-          pos: [1, 2, 3, sniext, sniext+1, sniext+4, host, host+1, midsld, endhost-2, endhost-1, endhost, extlen, -1, "2,midsld", "sniext+1,midsld", "host+1,midsld", "sniext+1,host+1,endhost-1"]
-      - family: disorder
-        actions: [multidisorder_tls]
-        params:
-          pos: [1, 2, sniext+1, sniext+4, host+1, midsld, endhost-1]
-      - family: fake
-        actions: [fake_tls]
-        params:
-          blob: [fake_default_tls, fake_dir_tls]
-          fooling: [none, badsum, autottl, badsum_autottl]
-          tls_mod: [none, random_sni, random_session_id]
-      - family: rst
-        actions: [rst_tls]
-        params:
-          rstack: [false, true]
-          fooling: [badsum, autottl, badsum_autottl]
-      - family: syndata
-        actions: [syndata_tls]
-        params:
-          blob: [fake_default_tls, fake_dir_tls]
-          fooling: [none, badsum, autottl]
-      - family: faked_split
-        actions: [fakedsplit_tls, fakeddisorder_tls]
-        params:
-          pos: [sniext+1, sniext+4, host+1, midsld, endhost-2, endhost-1]
-          fooling: [badsum, autottl, badsum_autottl]
-          pattern: [zero, random]
-      - family: hostfake
-        actions: [hostfakesplit_tls]
-        params:
-          host_template: [random, random.$1D, random.$2D, random.$3D]
-          midhost: [none, midsld, host+1]
-          disorder_after: [none, endhost, endhost+1]
-          fooling: [badsum, autottl, badsum_autottl]
-      - family: seqovl
-        actions: [multisplit_seqovl_tls, tcpseg_seqovl]
-        params:
-          pos: [sniext+1, sniext+4, host+1, midsld, endhost-1, "0,-1", "0,midsld", "host,endhost"]
-          seqovl: [1, 2, 4, 8, midsld-1]
-          seqovl_pattern: [zero, random]
-      - family: ipfrag
-        actions: [fake_ipfrag_tcp, multisplit_ipfrag_tcp]
-        params:
-          blob: [fake_default_tls, fake_dir_tls]
-          pos: [sniext+1, host+1, midsld]
-          ipfrag_pos: [8, 16, 24, 32, 48, 64, 96]
-          fooling: [none, badsum, autottl]
-      - family: wsize
-        actions: [wsize, wssize]
-        params:
-          wsize: [1, 2, 4, 8, 16]
-          scale: [0, 1, 2, 4, 6]
-      - family: oob
-        actions: [oob_byte, oob_char]
-        params:
-          byte: [0, 1, 13, 32]
-          char: [" ", A, "0"]
-          urp: [b, e, host, midsld]
-
+    - family: split
+      actions:
+      - multisplit_tls
+      params:
+        pos:
+        - 1
+        - 2
+        - 3
+        - sniext+1
+        - sniext+4
+        - host+1
+        - midsld
+        - endhost-2
+        - endhost-1
+        - extlen
+    - family: split
+      actions:
+      - multisplit_multi_pos_tls
+      params:
+        pos:
+        - 2,midsld
+        - sniext+1,midsld
+        - host+1,midsld
+        - sniext+1,host+1,endhost-1
+    - family: disorder
+      actions:
+      - multidisorder_tls
+      params:
+        pos:
+        - 1
+        - 2
+        - sniext+1
+        - sniext+4
+        - host+1
+        - midsld
+        - endhost-1
+    - family: fake
+      actions:
+      - fake_tls
+      params:
+        blob:
+        - fake_default_tls
+        fooling:
+        - none
+        - badsum
+        - autottl
+        - badsum_autottl
+        tls_mod:
+        - none
+        - random_sni
+        - random_session_id
+    - family: syndata
+      actions:
+      - syndata_tls
+      params:
+        blob:
+        - fake_default_tls
+        fooling:
+        - none
+        - badsum
+        - autottl
+    - family: faked_split
+      actions:
+      - fakedsplit_tls
+      params:
+        pos:
+        - sniext+1
+        - sniext+4
+        - host+1
+        - midsld
+        - endhost-2
+        - endhost-1
+        fooling:
+        - badsum
+        - autottl
+        - badsum_autottl
+        pattern:
+        - zero
+        - random
+    - family: faked_split
+      actions:
+      - fakeddisorder_tls
+      params:
+        pos:
+        - sniext+1
+        - host+1
+        - midsld
+        - endhost-1
+        fooling:
+        - badsum
+        - autottl
+        pattern:
+        - zero
+        - random
+    - family: seqovl
+      actions:
+      - multisplit_seqovl_tls
+      params:
+        pos:
+        - sniext+1
+        - sniext+4
+        - host+1
+        - midsld
+        - endhost-1
+        seqovl:
+        - 1
+        - 2
+        - 4
+        - 8
+        - midsld-1
+        seqovl_pattern:
+        - zero
+        - random
+    - family: seqovl
+      actions:
+      - tcpseg_seqovl
+      params:
+        pos:
+        - 0,-1
+        - 0,midsld
+        - host,endhost
+        seqovl:
+        - 1
+        - 2
+        - 4
+        - 8
+    - family: ipfrag
+      actions:
+      - fake_ipfrag_tcp
+      params:
+        blob:
+        - fake_default_tls
+        ipfrag_pos:
+        - 8
+        - 16
+        - 24
+        - 32
+        - 48
+        - 64
+        fooling:
+        - none
+        - badsum
+        - autottl
+    - family: ipfrag
+      actions:
+      - multisplit_ipfrag_tcp
+      params:
+        pos:
+        - sniext+1
+        - host+1
+        - midsld
+        ipfrag_pos:
+        - 8
+        - 16
+        - 24
+        - 32
+        - 48
+        - 64
+    - family: wsize
+      actions:
+      - wsize
+      - wssize
+      params:
+        wsize:
+        - 1
+        - 2
+        - 4
+        - 8
+        scale:
+        - 0
+        - 1
+        - 2
+        - 4
+        - 6
+    - family: oob
+      actions:
+      - oob_byte
+      params:
+        byte:
+        - 0
+        - 1
+        - 13
+        - 32
+        urp:
+        - b
+        - e
+        - host
+        - midsld
+    - family: oob
+      actions:
+      - oob_char
+      params:
+        char:
+        - ' '
+        - A
+        - '0'
+        urp:
+        - b
+        - e
+        - host
+        - midsld
     tls13:
-      - family: split
-        actions: [multisplit_tls, multisplit_multi_pos_tls]
-        params:
-          pos: [1, 2, 3, sniext, sniext+1, sniext+4, host, host+1, midsld, endhost-2, endhost-1, endhost, extlen, -1, "2,midsld", "sniext+1,midsld", "host+1,midsld", "sniext+1,host+1,endhost-1"]
-      - family: disorder
-        actions: [multidisorder_tls]
-        params:
-          pos: [1, 2, sniext+1, sniext+4, host+1, midsld, endhost-1]
-      - family: fake
-        actions: [fake_tls]
-        params:
-          blob: [fake_default_tls, fake_dir_tls]
-          fooling: [none, badsum, autottl, badsum_autottl]
-          tls_mod: [none, random_sni, random_session_id]
-      - family: rst
-        actions: [rst_tls]
-        params:
-          rstack: [false, true]
-          fooling: [badsum, autottl, badsum_autottl]
-      - family: faked_split
-        actions: [fakedsplit_tls, fakeddisorder_tls]
-        params:
-          pos: [sniext+1, sniext+4, host+1, midsld, endhost-2, endhost-1]
-          fooling: [badsum, autottl, badsum_autottl]
-          pattern: [zero, random]
-      - family: hostfake
-        actions: [hostfakesplit_tls]
-        params:
-          host_template: [random, random.$1D, random.$2D, random.$3D]
-          midhost: [none, midsld, host+1]
-          disorder_after: [none, endhost, endhost+1]
-          fooling: [badsum, autottl, badsum_autottl]
-      - family: seqovl
-        actions: [multisplit_seqovl_tls, tcpseg_seqovl]
-        params:
-          pos: [sniext+1, sniext+4, host+1, midsld, endhost-1, "0,-1", "0,midsld", "host,endhost"]
-          seqovl: [1, 2, 4, 8, midsld-1]
-          seqovl_pattern: [zero, random]
-      - family: ipfrag
-        actions: [fake_ipfrag_tcp, multisplit_ipfrag_tcp]
-        params:
-          blob: [fake_default_tls, fake_dir_tls]
-          pos: [sniext+1, host+1, midsld]
-          ipfrag_pos: [8, 16, 24, 32, 48, 64, 96]
-          fooling: [none, badsum, autottl]
-      - family: wsize
-        actions: [wsize, wssize]
-        params:
-          wsize: [1, 2, 4, 8]
-          scale: [0, 1, 2, 4, 6]
-
+    - family: split
+      actions:
+      - multisplit_tls
+      params:
+        pos:
+        - 1
+        - 2
+        - 3
+        - sniext+1
+        - sniext+4
+        - host+1
+        - midsld
+        - endhost-2
+        - endhost-1
+        - extlen
+    - family: split
+      actions:
+      - multisplit_multi_pos_tls
+      params:
+        pos:
+        - 2,midsld
+        - sniext+1,midsld
+        - host+1,midsld
+        - sniext+1,host+1,endhost-1
+    - family: disorder
+      actions:
+      - multidisorder_tls
+      params:
+        pos:
+        - 1
+        - 2
+        - sniext+1
+        - sniext+4
+        - host+1
+        - midsld
+        - endhost-1
+    - family: fake
+      actions:
+      - fake_tls
+      params:
+        blob:
+        - fake_default_tls
+        fooling:
+        - none
+        - badsum
+        - autottl
+        - badsum_autottl
+        tls_mod:
+        - none
+        - random_sni
+        - random_session_id
+    - family: syndata
+      actions:
+      - syndata_tls
+      params:
+        blob:
+        - fake_default_tls
+        fooling:
+        - none
+        - badsum
+        - autottl
+    - family: faked_split
+      actions:
+      - fakedsplit_tls
+      params:
+        pos:
+        - sniext+1
+        - sniext+4
+        - host+1
+        - midsld
+        - endhost-2
+        - endhost-1
+        fooling:
+        - badsum
+        - autottl
+        - badsum_autottl
+        pattern:
+        - zero
+        - random
+    - family: faked_split
+      actions:
+      - fakeddisorder_tls
+      params:
+        pos:
+        - sniext+1
+        - host+1
+        - midsld
+        - endhost-1
+        fooling:
+        - badsum
+        - autottl
+        pattern:
+        - zero
+        - random
+    - family: seqovl
+      actions:
+      - multisplit_seqovl_tls
+      params:
+        pos:
+        - sniext+1
+        - sniext+4
+        - host+1
+        - midsld
+        - endhost-1
+        seqovl:
+        - 1
+        - 2
+        - 4
+        - 8
+        - midsld-1
+        seqovl_pattern:
+        - zero
+        - random
+    - family: seqovl
+      actions:
+      - tcpseg_seqovl
+      params:
+        pos:
+        - 0,-1
+        - 0,midsld
+        - host,endhost
+        seqovl:
+        - 1
+        - 2
+        - 4
+        - 8
+    - family: ipfrag
+      actions:
+      - fake_ipfrag_tcp
+      params:
+        blob:
+        - fake_default_tls
+        ipfrag_pos:
+        - 8
+        - 16
+        - 24
+        - 32
+        - 48
+        - 64
+        fooling:
+        - none
+        - badsum
+        - autottl
+    - family: ipfrag
+      actions:
+      - multisplit_ipfrag_tcp
+      params:
+        pos:
+        - sniext+1
+        - host+1
+        - midsld
+        ipfrag_pos:
+        - 8
+        - 16
+        - 24
+        - 32
+        - 48
+        - 64
+    - family: wsize
+      actions:
+      - wsize
+      - wssize
+      params:
+        wsize:
+        - 1
+        - 2
+        - 4
+        - 8
+        scale:
+        - 0
+        - 1
+        - 2
+        - 4
+        - 6
+    - family: oob
+      actions:
+      - oob_byte
+      params:
+        byte:
+        - 0
+        - 1
+        - 13
+        - 32
+        urp:
+        - b
+        - e
+        - host
+        - midsld
+    - family: oob
+      actions:
+      - oob_char
+      params:
+        char:
+        - ' '
+        - A
+        - '0'
+        urp:
+        - b
+        - e
+        - host
+        - midsld
     quic:
-      - family: fake
-        actions: [fake_quic]
-        params:
-          blob: [fake_default_quic, fake_dir_quic]
-          repeats: [1, 2, 5, 10, 20]
-          fooling: [none, autottl]
-      - family: ipfrag
-        actions: [fake_ipfrag_udp]
-        params:
-          blob: [fake_default_quic, fake_dir_quic]
-          ipfrag_pos: [8, 16, 32, 64, 96]
-          repeats: [1, 2, 5]
-      - family: udp_len
-        actions: [udplen_increase]
-        params:
-          increment: [1, 2, 4, 8, 16, 32]
-          min: [0, 8, 16]
-          max: [0, 1200, 1500]
-          pattern: [zero, random]
-
+    - family: fake
+      actions:
+      - fake_quic
+      params:
+        blob:
+        - fake_default_quic
+        repeats:
+        - 1
+        - 2
+        - 5
+        - 10
+        fooling:
+        - none
+        - autottl
+    - family: ipfrag
+      actions:
+      - fake_ipfrag_udp
+      params:
+        blob:
+        - fake_default_quic
+        ipfrag_pos:
+        - 8
+        - 16
+        - 32
+        - 64
+        repeats:
+        - 1
+        - 2
+        - 5
+    - family: udp_len
+      actions:
+      - udplen_increase
+      params:
+        increment:
+        - 1
+        - 2
+        - 4
+        - 8
+        min:
+        - 0
+        - 8
+        max:
+        - 0
+        - 1200
+        pattern:
+        - zero
+        - random
   expand:
     http:
-      family_order: [http_trick, split, disorder, fake, rst, faked_split, hostfake, seqovl, ipfrag, wsize, oob]
+      family_order:
+      - http_trick
+      - split
+      - disorder
+      - fake
+      - syndata
+      - faked_split
+      - seqovl
+      - ipfrag
+      - wsize
+      - oob
     tls12:
-      family_order: [split, disorder, fake, rst, syndata, faked_split, hostfake, seqovl, ipfrag, wsize, oob]
+      family_order:
+      - split
+      - disorder
+      - fake
+      - syndata
+      - faked_split
+      - seqovl
+      - ipfrag
+      - wsize
+      - oob
     tls13:
-      family_order: [split, disorder, fake, rst, syndata, faked_split, hostfake, seqovl, ipfrag, wsize, oob]
+      family_order:
+      - split
+      - disorder
+      - fake
+      - syndata
+      - faked_split
+      - seqovl
+      - ipfrag
+      - wsize
+      - oob
     quic:
-      family_order: [fake, ipfrag, udp_len]
-
+      family_order:
+      - fake
+      - ipfrag
+      - udp_len
 transition_costs:
   default: 10
   same_family: 1
-  same_action: 1
+  same_action: 0
   same_protocol: 1
   different_protocol: 8
-  same_param_neighbor: 1
-  same_param_far: 3
   family_matrix:
-    baseline: {http_trick: 1, split: 2, fake: 3, wsize: 4}
-    http_trick: {split: 2, disorder: 3, fake: 3, faked_split: 4}
-    split: {disorder: 1, seqovl: 2, faked_split: 2, fake: 3, syndata: 4, ipfrag: 5, wsize: 4, oob: 7}
-    disorder: {split: 1, faked_split: 2, seqovl: 3, fake: 3, ipfrag: 5, wsize: 5, oob: 7}
-    fake: {faked_split: 2, syndata: 2, ipfrag: 4, split: 3, disorder: 3, wsize: 5, oob: 6}
-    syndata: {fake: 2, faked_split: 3, split: 4, ipfrag: 5}
-    faked_split: {fake: 2, split: 2, disorder: 2, seqovl: 3, ipfrag: 4, oob: 6}
-    seqovl: {split: 2, disorder: 3, faked_split: 3, ipfrag: 5, wsize: 5}
-    ipfrag: {fake: 4, seqovl: 5, udp_len: 4, wsize: 5, oob: 7}
-    udp_len: {fake: 3, ipfrag: 4}
-    wsize: {split: 4, disorder: 5, fake: 5, ipfrag: 5, oob: 6}
-    oob: {split: 7, disorder: 7, fake: 6, wsize: 6}
+    baseline:
+      http_trick: 1
+      split: 2
+      fake: 3
+      wsize: 4
+    http_trick:
+      split: 2
+      disorder: 3
+      fake: 3
+      faked_split: 4
+      syndata: 5
+    split:
+      disorder: 1
+      seqovl: 2
+      faked_split: 2
+      fake: 3
+      syndata: 4
+      ipfrag: 5
+      wsize: 4
+      oob: 7
+    disorder:
+      split: 1
+      faked_split: 2
+      seqovl: 3
+      fake: 3
+      ipfrag: 5
+      wsize: 5
+      oob: 7
+    fake:
+      faked_split: 2
+      syndata: 2
+      ipfrag: 4
+      split: 3
+      disorder: 3
+      udp_len: 3
+      wsize: 5
+      oob: 6
+    syndata:
+      fake: 2
+      faked_split: 3
+      split: 4
+      ipfrag: 5
+    faked_split:
+      fake: 2
+      split: 2
+      disorder: 2
+      seqovl: 3
+      ipfrag: 4
+      oob: 6
+    seqovl:
+      split: 2
+      disorder: 3
+      faked_split: 3
+      ipfrag: 5
+      wsize: 5
+    ipfrag:
+      fake: 4
+      seqovl: 5
+      udp_len: 4
+      wsize: 5
+      oob: 7
+    wsize:
+      split: 4
+      disorder: 5
+      fake: 5
+      ipfrag: 5
+      oob: 6
+    oob:
+      split: 7
+      disorder: 7
+      fake: 6
+      wsize: 6
+    udp_len:
+      fake: 3
+      ipfrag: 4
